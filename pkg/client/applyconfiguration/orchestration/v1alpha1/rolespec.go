@@ -32,6 +32,8 @@ type RoleSpecApplyConfiguration struct {
 	UpdateStrategy      *RoleUpdateStrategyApplyConfiguration  `json:"updateStrategy,omitempty"`
 	Stateful            *bool                                  `json:"stateful,omitempty"`
 	Template            *v1.PodTemplateSpec                    `json:"template,omitempty"`
+	StableTemplate      *v1.PodTemplateSpec                    `json:"stableTemplate,omitempty"`
+	StableRevision      *string                                `json:"stableRevision,omitempty"`
 	DisruptionTolerance *DisruptionToleranceApplyConfiguration `json:"disruptionTolerance,omitempty"`
 	SchedulingStrategy  *SchedulingStrategyApplyConfiguration  `json:"schedulingStrategy,omitempty"`
 }
@@ -103,6 +105,22 @@ func (b *RoleSpecApplyConfiguration) WithStateful(value bool) *RoleSpecApplyConf
 // If called multiple times, the Template field is set to the value of the last call.
 func (b *RoleSpecApplyConfiguration) WithTemplate(value v1.PodTemplateSpec) *RoleSpecApplyConfiguration {
 	b.Template = &value
+	return b
+}
+
+// WithStableTemplate sets the StableTemplate field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the StableTemplate field is set to the value of the last call.
+func (b *RoleSpecApplyConfiguration) WithStableTemplate(value v1.PodTemplateSpec) *RoleSpecApplyConfiguration {
+	b.StableTemplate = &value
+	return b
+}
+
+// WithStableRevision sets the StableRevision field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the StableRevision field is set to the value of the last call.
+func (b *RoleSpecApplyConfiguration) WithStableRevision(value string) *RoleSpecApplyConfiguration {
+	b.StableRevision = &value
 	return b
 }
 

@@ -147,7 +147,19 @@ func (r *RoleSetReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		klog.Warningf("roleset %s/%s sync historical-node bindings error %v", roleSet.Namespace, roleSet.Name, err)
 	}
 
-	// 2. sync pods
+	// 2. reconcile optional rollback state. This may swap a role back to its
+	// last stable template; syncPods below drives the (possibly swapped) spec
+	// through the regular rolling path, so drain and disruption budgets apply.
+	rolloutStatuses, err := (&rollbackPlanner{
+		cli:      r.Client,
+		recorder: r.EventRecorder,
+		now:      time.Now(),
+	}).plan(ctx, roleSet)
+	if err != nil {
+		managedErrors = append(managedErrors, fmt.Errorf("rollback planning error %v", err))
+	}
+
+	// 3. sync pods
 	syncResult, err := r.syncPods(ctx, roleSet)
 	if err != nil {
 		managedErrors = append(managedErrors, fmt.Errorf("sync pod error %v", err))
@@ -156,8 +168,8 @@ func (r *RoleSetReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		managedErrors = append(managedErrors, fmt.Errorf("emit topology policy event error %v", err))
 	}
 
-	// 3. update roleset status
-	status, err := r.calculateStatus(ctx, roleSet, managedErrors, podGroupSyncErr)
+	// 4. update roleset status
+	status, err := r.calculateStatus(ctx, roleSet, managedErrors, podGroupSyncErr, rolloutStatuses)
 	if err != nil {
 		klog.Infof("roleset %s/%s calculate status error %v", roleSet.Namespace, roleSet.Name, err)
 		return ctrl.Result{RequeueAfter: 1 * time.Minute}, err

@@ -37,11 +37,31 @@ type RoleSetSpec struct {
 	// +kubebuilder:default=Sequential
 	UpdateStrategy RoleSetUpdateStrategyType `json:"updateStrategy,omitempty"`
 
+	// RollbackStrategy enables automatic rollback of a role to its last stable
+	// template when an update fails to become ready within the configured
+	// failure threshold. When nil, the RoleSet keeps its roll-forward-only
+	// behavior and a not-ready update must be reverted manually.
+	// +optional
+	RollbackStrategy *RollbackStrategy `json:"rollbackStrategy,omitempty"`
+
 	// +optional
 	SchedulingStrategy *SchedulingStrategy `json:"schedulingStrategy,omitempty"`
 
 	// +optional
 	TopologyPolicy *TopologyPolicy `json:"topologyPolicy,omitempty"`
+}
+
+// RollbackStrategy configures automatic per-role rollback on failed updates.
+type RollbackStrategy struct {
+	// FailureThresholdSeconds is the time to wait for a role update to become
+	// ready, starting from the moment the first pod of the new revision is
+	// observed, before the controller rolls the role back to its last stable
+	// template. A pod stuck draining or terminating past the threshold is
+	// reported with reason DrainTimeout; otherwise the reason is
+	// ProgressDeadlineExceeded. Defaults to 600 seconds when omitted.
+	// +optional
+	// +kubebuilder:validation:Minimum=1
+	FailureThresholdSeconds *int32 `json:"failureThresholdSeconds,omitempty"`
 }
 
 // +kubebuilder:validation:MaxProperties=1
@@ -237,6 +257,18 @@ type RoleSpec struct {
 	// +optional
 	Template v1.PodTemplateSpec `json:"template,omitempty"`
 
+	// StableTemplate records the last PodTemplateSpec for which every pod of
+	// this role was observed ready. It is managed by the RoleSet controller
+	// when spec.rollbackStrategy is enabled and is used as the rollback target
+	// when a later update fails. Users should not set it manually.
+	// +optional
+	StableTemplate *v1.PodTemplateSpec `json:"stableTemplate,omitempty"`
+
+	// StableRevision is the template hash of StableTemplate.
+	// Managed by the RoleSet controller together with StableTemplate.
+	// +optional
+	StableRevision string `json:"stableRevision,omitempty"`
+
 	// DisruptionTolerance indicates how many pods can be unavailable during the preemption/eviction.
 	// +optional
 	DisruptionTolerance DisruptionTolerance `json:"disruptionTolerance,omitempty"`
@@ -331,6 +363,52 @@ const (
 	RoleSetGangSchedulingError ConditionType = "GangSchedulingError"
 )
 
+// RoleRolloutState is the rollout state of a single role.
+// +enum
+type RoleRolloutState string
+
+const (
+	// RoleRolloutStable means every pod of the role is ready on either the
+	// desired template or, after a rollback, on the last stable template.
+	RoleRolloutStable RoleRolloutState = "Stable"
+	// RoleRolloutProgressing means the role is rolling toward TargetRevision.
+	RoleRolloutProgressing RoleRolloutState = "Progressing"
+	// RoleRolloutRollingBack means a failed update triggered an automatic
+	// rollback and the role is still replacing failed-revision pods.
+	RoleRolloutRollingBack RoleRolloutState = "RollingBack"
+)
+
+// RollbackRecord describes one automatic rollback of a role.
+type RollbackRecord struct {
+	// TargetRevision is the template hash of the revision that failed.
+	// +optional
+	TargetRevision string `json:"targetRevision,omitempty"`
+
+	// RollbackRevision is the stable template hash the role was rolled back to.
+	// +optional
+	RollbackRevision string `json:"rollbackRevision,omitempty"`
+
+	// FailedTemplate is the template of the failed TargetRevision. It is only
+	// kept on the most recent record and is used to resume the update when an
+	// administrator requests manual recovery.
+	// +optional
+	FailedTemplate *v1.PodTemplateSpec `json:"failedTemplate,omitempty"`
+
+	// Reason is the failure reason, e.g. ProgressDeadlineExceeded or DrainTimeout.
+	// +optional
+	Reason string `json:"reason,omitempty"`
+
+	// +optional
+	Message string `json:"message,omitempty"`
+
+	RolledAt metav1.Time `json:"rolledAt"`
+
+	// RecoveredAt is set when an administrator requests manual recovery and
+	// the failed revision is retried.
+	// +optional
+	RecoveredAt *metav1.Time `json:"recoveredAt,omitempty"`
+}
+
 type RoleStatus struct {
 	Name string `json:"name,omitempty"`
 
@@ -348,6 +426,42 @@ type RoleStatus struct {
 
 	// +optional
 	UpdatedReadyReplicas int32 `json:"updatedReadyReplicas,omitempty"`
+
+	// CurrentRevision is the template hash of the revision on which the role
+	// last reached a fully ready state.
+	// +optional
+	CurrentRevision string `json:"currentRevision,omitempty"`
+
+	// TargetRevision is the template hash the controller is currently driving
+	// the role toward. It equals CurrentRevision when the role is stable.
+	// +optional
+	TargetRevision string `json:"targetRevision,omitempty"`
+
+	// RolloutState is Stable, Progressing or RollingBack.
+	// +optional
+	// +kubebuilder:validation:Enum={Stable,Progressing,RollingBack}
+	RolloutState RoleRolloutState `json:"rolloutState,omitempty"`
+
+	// UpdateStartedAt is when the controller first observed a pod of
+	// TargetRevision during the current update.
+	// +optional
+	UpdateStartedAt *metav1.Time `json:"updateStartedAt,omitempty"`
+
+	// RollbackCount is the cumulative number of automatic rollbacks for this role.
+	// +optional
+	RollbackCount int32 `json:"rollbackCount,omitempty"`
+
+	// FailureReason is the reason of the latest failed update.
+	// +optional
+	FailureReason string `json:"failureReason,omitempty"`
+
+	// +optional
+	FailureMessage string `json:"failureMessage,omitempty"`
+
+	// RollbackHistory records automatic rollbacks, newest first, capped at 10.
+	// +optional
+	// +listType=atomic
+	RollbackHistory []RollbackRecord `json:"rollbackHistory,omitempty"`
 }
 
 //+kubebuilder:object:root=true

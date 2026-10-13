@@ -26,6 +26,7 @@ import (
 type RoleSetSpecApplyConfiguration struct {
 	Roles              []RoleSpecApplyConfiguration                     `json:"roles,omitempty"`
 	UpdateStrategy     *orchestrationv1alpha1.RoleSetUpdateStrategyType `json:"updateStrategy,omitempty"`
+	RollbackStrategy   *RollbackStrategyApplyConfiguration              `json:"rollbackStrategy,omitempty"`
 	SchedulingStrategy *SchedulingStrategyApplyConfiguration            `json:"schedulingStrategy,omitempty"`
 	TopologyPolicy     *TopologyPolicyApplyConfiguration                `json:"topologyPolicy,omitempty"`
 }
@@ -54,6 +55,14 @@ func (b *RoleSetSpecApplyConfiguration) WithRoles(values ...*RoleSpecApplyConfig
 // If called multiple times, the UpdateStrategy field is set to the value of the last call.
 func (b *RoleSetSpecApplyConfiguration) WithUpdateStrategy(value orchestrationv1alpha1.RoleSetUpdateStrategyType) *RoleSetSpecApplyConfiguration {
 	b.UpdateStrategy = &value
+	return b
+}
+
+// WithRollbackStrategy sets the RollbackStrategy field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the RollbackStrategy field is set to the value of the last call.
+func (b *RoleSetSpecApplyConfiguration) WithRollbackStrategy(value *RollbackStrategyApplyConfiguration) *RoleSetSpecApplyConfiguration {
+	b.RollbackStrategy = value
 	return b
 }
 

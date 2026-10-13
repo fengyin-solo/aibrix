@@ -47,6 +47,11 @@ const (
 	RoleInPlaceUpdateReadyCondition = "stormservice.orchestration.aibrix.ai/in-place-update-ready"
 	// RoleSetHistoricalNodeBindingsAnnotationKey stores controller-owned historical node bindings for RoleSet replacement scheduling.
 	RoleSetHistoricalNodeBindingsAnnotationKey = "orchestration.aibrix.ai/historical-node-bindings"
+	// RoleSetRollbackRecoveryAnnotationKey lets administrators clear a failed
+	// update state and retry the failed revision. The value is "*" (or empty)
+	// for every role, or a comma-separated list of role names. The annotation is
+	// consumed (removed) by the RoleSet controller.
+	RoleSetRollbackRecoveryAnnotationKey = "orchestration.aibrix.ai/rollback-recovery"
 
 	RoleInPlaceUpdatePendingReasonPodNotReady            = "PodNotReady"
 	RoleInPlaceUpdatePendingReasonContainerStatusMissing = "ContainerStatusMissing"

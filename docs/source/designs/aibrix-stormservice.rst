@@ -876,6 +876,62 @@ the rollout. Roles with ``podGroupSize > 1`` are managed through PodSet and also
 fall back to recreation. Omitting the role strategy selects the default
 ``Recreate`` behavior.
 
+Automatic rollback on failed updates
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+By default the RoleSet rollout is roll-forward only: if a role's new revision
+never becomes ready, an administrator has to revert the template manually.
+Enable automatic per-role rollback with ``spec.rollbackStrategy``:
+
+.. code-block:: yaml
+
+   spec:
+     updateStrategy: Sequential   # Parallel, Sequential or Interleave
+     rollbackStrategy:
+       failureThresholdSeconds: 600
+     roles:
+       - name: worker
+         replicas: 2
+         updateStrategy:
+           maxSurge: 1
+           maxUnavailable: 0
+
+When rollback is enabled, the controller records the last fully-ready template
+of each role in the controller-managed fields ``spec.roles[].stableTemplate``
+and ``stableRevision``. Once the first Pod of a new revision is observed, a
+failure deadline is armed. Roles that have not started yet (for example later
+roles in a ``Sequential`` rollout) do not age out early. If the role does not
+become ready before ``failureThresholdSeconds`` (default 600), the controller:
+
+1. swaps the role's active template back to the last stable template and sets
+   the per-role state to ``RollingBack``;
+2. drives the replacement through the same ``Parallel``, ``Sequential`` or
+   ``Interleave`` rolling path, so drain (``roles[].drain``), ``maxSurge``,
+   ``maxUnavailable`` and ``podGroupSize`` are still enforced — stable
+   revision Pods are never created twice;
+3. records ``rollbackCount``, the failure reason (``ProgressDeadlineExceeded``
+   or ``DrainTimeout`` when a Pod is stuck draining or terminating), a message
+   and a ``rollbackHistory`` entry on ``status.roles[]``, and sets the RoleSet
+   ``Progressing`` condition.
+
+The role returns to the ``Stable`` state only after every Pod of the restored
+revision is ready; the failure reason remains recorded until an administrator
+acts. To retry the failed revision, annotate the RoleSet; the annotation is
+consumed (removed) by the controller:
+
+.. code-block:: shell
+
+   # retry every failed role
+   kubectl annotate roleset <name> orchestration.aibrix.ai/rollback-recovery='*'
+   # or retry selected roles
+   kubectl annotate roleset <name> orchestration.aibrix.ai/rollback-recovery='worker,server'
+
+Recovery clears the failure reason and restores the failed revision's template
+from the newest history entry. If a newer revision is already in flight,
+recovery only clears the failure without overwriting that revision. When
+``rollbackStrategy`` is omitted, no status rollout fields are maintained and
+the existing roll-forward behavior is unchanged.
+
 Trigger and observe an image update
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 

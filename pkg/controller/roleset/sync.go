@@ -127,7 +127,7 @@ func (r *RoleSetReconciler) syncPods(ctx context.Context, roleSet *orchestration
 	return manager.Next(ctx, roleSet)
 }
 
-func (r *RoleSetReconciler) calculateStatus(ctx context.Context, rs *orchestrationv1alpha1.RoleSet, managedErrors []error, podGroupSyncErr error) (*orchestrationv1alpha1.RoleSetStatus, error) {
+func (r *RoleSetReconciler) calculateStatus(ctx context.Context, rs *orchestrationv1alpha1.RoleSet, managedErrors []error, podGroupSyncErr error, rolloutStatuses rolloutStatuses) (*orchestrationv1alpha1.RoleSetStatus, error) {
 	newStatus := rs.Status.DeepCopy()
 	newStatus.Roles = nil
 	var notReadyRoles []string
@@ -137,6 +137,7 @@ func (r *RoleSetReconciler) calculateStatus(ctx context.Context, rs *orchestrati
 			klog.Warningf("Failed to calculate status for role %s: %v", role.Name, err)
 			continue
 		} else {
+			mergeRolloutStatus(roleStatus, rolloutStatuses[role.Name])
 			newStatus.Roles = append(newStatus.Roles, *roleStatus)
 			if roleStatus.ReadyReplicas < *role.Replicas {
 				notReadyRoles = append(notReadyRoles, role.Name)
@@ -150,6 +151,12 @@ func (r *RoleSetReconciler) calculateStatus(ctx context.Context, rs *orchestrati
 	} else {
 		readyCondition := utils.NewCondition(orchestrationv1alpha1.RoleSetReady, v1.ConditionTrue, "roleset is ready", "")
 		SetRoleSetCondition(newStatus, *readyCondition)
+	}
+
+	// The Progressing condition is only managed when automatic rollback is
+	// enabled; with rollback disabled the roll-forward behavior is unchanged.
+	if rolloutStatuses != nil {
+		setProgressingCondition(newStatus, rs, rolloutStatuses)
 	}
 
 	failureCond := utils.GetCondition(rs.Status.Conditions, orchestrationv1alpha1.RoleSetReplicaFailure)

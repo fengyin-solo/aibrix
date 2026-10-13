@@ -111,6 +111,10 @@ func ForKind(kind schema.GroupVersionKind) interface{} {
 		return &applyconfigurationorchestrationv1alpha1.RoleStatusApplyConfiguration{}
 	case orchestrationv1alpha1.SchemeGroupVersion.WithKind("RoleUpdateStrategy"):
 		return &applyconfigurationorchestrationv1alpha1.RoleUpdateStrategyApplyConfiguration{}
+	case orchestrationv1alpha1.SchemeGroupVersion.WithKind("RollbackRecord"):
+		return &applyconfigurationorchestrationv1alpha1.RollbackRecordApplyConfiguration{}
+	case orchestrationv1alpha1.SchemeGroupVersion.WithKind("RollbackStrategy"):
+		return &applyconfigurationorchestrationv1alpha1.RollbackStrategyApplyConfiguration{}
 	case orchestrationv1alpha1.SchemeGroupVersion.WithKind("SchedulingStrategy"):
 		return &applyconfigurationorchestrationv1alpha1.SchedulingStrategyApplyConfiguration{}
 	case orchestrationv1alpha1.SchemeGroupVersion.WithKind("StormService"):

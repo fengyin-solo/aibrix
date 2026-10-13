@@ -17,15 +17,28 @@ limitations under the License.
 
 package v1alpha1
 
+import (
+	v1alpha1 "github.com/vllm-project/aibrix/api/orchestration/v1alpha1"
+	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+)
+
 // RoleStatusApplyConfiguration represents a declarative configuration of the RoleStatus type for use
 // with apply.
 type RoleStatusApplyConfiguration struct {
-	Name                 *string `json:"name,omitempty"`
-	Replicas             *int32  `json:"replicas,omitempty"`
-	ReadyReplicas        *int32  `json:"readyReplicas,omitempty"`
-	NotReadyReplicas     *int32  `json:"notReadyReplicas,omitempty"`
-	UpdatedReplicas      *int32  `json:"updatedReplicas,omitempty"`
-	UpdatedReadyReplicas *int32  `json:"updatedReadyReplicas,omitempty"`
+	Name                 *string                            `json:"name,omitempty"`
+	Replicas             *int32                             `json:"replicas,omitempty"`
+	ReadyReplicas        *int32                             `json:"readyReplicas,omitempty"`
+	NotReadyReplicas     *int32                             `json:"notReadyReplicas,omitempty"`
+	UpdatedReplicas      *int32                             `json:"updatedReplicas,omitempty"`
+	UpdatedReadyReplicas *int32                             `json:"updatedReadyReplicas,omitempty"`
+	CurrentRevision      *string                            `json:"currentRevision,omitempty"`
+	TargetRevision       *string                            `json:"targetRevision,omitempty"`
+	RolloutState         *v1alpha1.RoleRolloutState         `json:"rolloutState,omitempty"`
+	UpdateStartedAt      *v1.Time                           `json:"updateStartedAt,omitempty"`
+	RollbackCount        *int32                             `json:"rollbackCount,omitempty"`
+	FailureReason        *string                            `json:"failureReason,omitempty"`
+	FailureMessage       *string                            `json:"failureMessage,omitempty"`
+	RollbackHistory      []RollbackRecordApplyConfiguration `json:"rollbackHistory,omitempty"`
 }
 
 // RoleStatusApplyConfiguration constructs a declarative configuration of the RoleStatus type for use with
@@ -79,5 +92,74 @@ func (b *RoleStatusApplyConfiguration) WithUpdatedReplicas(value int32) *RoleSta
 // If called multiple times, the UpdatedReadyReplicas field is set to the value of the last call.
 func (b *RoleStatusApplyConfiguration) WithUpdatedReadyReplicas(value int32) *RoleStatusApplyConfiguration {
 	b.UpdatedReadyReplicas = &value
+	return b
+}
+
+// WithCurrentRevision sets the CurrentRevision field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the CurrentRevision field is set to the value of the last call.
+func (b *RoleStatusApplyConfiguration) WithCurrentRevision(value string) *RoleStatusApplyConfiguration {
+	b.CurrentRevision = &value
+	return b
+}
+
+// WithTargetRevision sets the TargetRevision field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the TargetRevision field is set to the value of the last call.
+func (b *RoleStatusApplyConfiguration) WithTargetRevision(value string) *RoleStatusApplyConfiguration {
+	b.TargetRevision = &value
+	return b
+}
+
+// WithRolloutState sets the RolloutState field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the RolloutState field is set to the value of the last call.
+func (b *RoleStatusApplyConfiguration) WithRolloutState(value v1alpha1.RoleRolloutState) *RoleStatusApplyConfiguration {
+	b.RolloutState = &value
+	return b
+}
+
+// WithUpdateStartedAt sets the UpdateStartedAt field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the UpdateStartedAt field is set to the value of the last call.
+func (b *RoleStatusApplyConfiguration) WithUpdateStartedAt(value v1.Time) *RoleStatusApplyConfiguration {
+	b.UpdateStartedAt = &value
+	return b
+}
+
+// WithRollbackCount sets the RollbackCount field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the RollbackCount field is set to the value of the last call.
+func (b *RoleStatusApplyConfiguration) WithRollbackCount(value int32) *RoleStatusApplyConfiguration {
+	b.RollbackCount = &value
+	return b
+}
+
+// WithFailureReason sets the FailureReason field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the FailureReason field is set to the value of the last call.
+func (b *RoleStatusApplyConfiguration) WithFailureReason(value string) *RoleStatusApplyConfiguration {
+	b.FailureReason = &value
+	return b
+}
+
+// WithFailureMessage sets the FailureMessage field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the FailureMessage field is set to the value of the last call.
+func (b *RoleStatusApplyConfiguration) WithFailureMessage(value string) *RoleStatusApplyConfiguration {
+	b.FailureMessage = &value
+	return b
+}
+
+// WithRollbackHistory adds the given value to the RollbackHistory field in the declarative configuration
+// and returns the receiver, so that objects can be build by chaining "With" function invocations.
+// If called multiple times, values provided by each call will be appended to the RollbackHistory field.
+func (b *RoleStatusApplyConfiguration) WithRollbackHistory(values ...*RollbackRecordApplyConfiguration) *RoleStatusApplyConfiguration {
+	for i := range values {
+		if values[i] == nil {
+			panic("nil value passed to WithRollbackHistory")
+		}
+		b.RollbackHistory = append(b.RollbackHistory, *values[i])
+	}
 	return b
 }

@@ -39,7 +39,9 @@ How it works
        end
 
 * The runtime listens on port ``8080`` and reaches the engine through
-  ``INFERENCE_ENGINE_ENDPOINT`` (``http://localhost:8000`` by default).
+  ``INFERENCE_ENGINE_ENDPOINT``. When the sidecar is injected, this endpoint is derived
+  from the engine container's declared ports (see "Automatic Sidecar Injection" below),
+  falling back to ``http://localhost:8000`` when no port is declared.
 * The controller manager flag ``--enable-runtime-sidecar`` only affects the ModelAdapter
   (LoRA) controller. With it on, that controller uses the runtime API on ``8080`` when a
   container named ``aibrix-runtime`` is present and the engine's own API on ``8000`` otherwise;
@@ -87,13 +89,27 @@ What gets injected, so you know what to expect in the pod spec:
   ``aibrix/runtime:v0.5.0`` unless overridden by the image annotation below;
 * ``INFERENCE_ENGINE`` taken from the ``model.aibrix.ai/engine`` annotation on the workload
   when set, otherwise inferred from the engine container's image name (``vllm``, ``sglang``,
-  ``tgi``, ``triton``, ``llamacpp``, else ``unknown``), and
-  ``INFERENCE_ENGINE_ENDPOINT=http://localhost:8000``. Only ``vllm`` yields a runtime that
-  starts, so inject it only into vLLM workloads;
+  ``tgi``, ``triton``, ``llamacpp``, else ``unknown``). Only ``vllm`` yields a runtime that
+  starts, so inject it only into vLLM workloads; an engine type that cannot be inferred is
+  reported as an admission warning;
+* ``INFERENCE_ENGINE_ENDPOINT`` derived from the engine container's declared ports: a TCP
+  port named ``inference``, ``http``, ``https`` or ``api`` is preferred, otherwise the
+  smallest declared TCP port is used, and ``http://localhost:8000`` is the fallback when no
+  port is declared. The ``model.aibrix.ai/sidecar-engine-endpoint`` annotation overrides the
+  derived value;
 * a container port named ``metrics`` on ``8080``, a liveness probe on ``/healthz`` and a
   readiness probe on ``/ready``;
-* a volume ``adapter-storage`` mounted at ``/tmp/aibrix/adapters`` for downloaded adapters;
+* a volume ``adapter-storage`` mounted at ``/tmp/aibrix/adapters`` for downloaded adapters.
+  When a volume with that name already exists, its source (PVC, hostPath, ...) is kept as
+  declared instead of being replaced by an emptyDir; a non-emptyDir source is reported as an
+  admission warning;
 * resource requests of ``100m`` CPU and ``256Mi`` memory, limits of ``500m`` and ``512Mi``.
+
+Injection is idempotent. Pod templates that already contain the ``aibrix-runtime`` container
+are left untouched, and the webhook never modifies existing volumes, environment variables or
+resources of engine containers. Unrecognized values of the injection switch, runtime image or
+engine annotations produce admission warnings; a malformed engine endpoint annotation is
+rejected.
 
 The webhook is registered for ``Deployment`` and ``StormService`` objects with
 ``failurePolicy: Ignore``, so a webhook outage never blocks workload creation; it only means
@@ -140,6 +156,30 @@ You can specify a custom runtime image using an annotation:
         model.aibrix.ai/sidecar-runtime-image: "aibrix/runtime:v0.5.0"  # Custom image
     spec:
       # ...
+
+**Customize Engine Endpoint**
+
+By default the endpoint the runtime uses to reach the engine is derived from the engine
+container's declared ports (a port named ``inference``, ``http``, ``https`` or ``api`` is
+preferred, then the smallest declared TCP port, falling back to ``http://localhost:8000``).
+When the endpoint cannot be expressed through container ports, override it explicitly:
+
+.. code-block:: yaml
+
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata:
+      name: vllm-server
+      annotations:
+        model.aibrix.ai/sidecar-injection: "true"
+        model.aibrix.ai/sidecar-engine-endpoint: "http://localhost:8080"  # Custom endpoint
+    spec:
+      # ...
+
+The webhook validates the injection annotations on create and update: unrecognized values
+of the injection switch, a blank or malformed runtime image, or an unknown
+``model.aibrix.ai/engine`` value produce admission warnings, while a malformed engine
+endpoint URL is rejected.
 
 **Enable Global Runtime Flag**
 
@@ -632,6 +672,9 @@ Configuration reference
      - Ask the webhook to inject the runtime into a ``Deployment`` or ``StormService``.
    * - ``model.aibrix.ai/sidecar-runtime-image`` (annotation)
      - Runtime image to inject instead of the default.
+   * - ``model.aibrix.ai/sidecar-engine-endpoint`` (annotation)
+     - Overrides the ``INFERENCE_ENGINE_ENDPOINT`` derived from the engine container ports;
+       must be an absolute http(s) URL.
    * - ``--enable-runtime-sidecar`` (controller manager flag, default ``false``)
      - Let controllers use the runtime API when the ``aibrix-runtime`` container is present.
 

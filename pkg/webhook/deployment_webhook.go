@@ -21,14 +21,10 @@ import (
 	"fmt"
 
 	appsv1 "k8s.io/api/apps/v1"
-	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
-
-	"github.com/vllm-project/aibrix/pkg/constants"
-	"github.com/vllm-project/aibrix/pkg/utils"
 )
 
 // SetupDeploymentWebhookWithManager registers the webhook for Deployment in the manager.
@@ -53,96 +49,20 @@ func (r *DeploymentCustomDefaulter) Default(_ context.Context, obj runtime.Objec
 		return fmt.Errorf("expected a Deployment object but got %T", obj)
 	}
 
-	// Only proceed if the sidecar injection annotation is present and set to "true"
+	// Only proceed if the sidecar injection annotation is present and set to "true".
 	annotations := deployment.GetAnnotations()
-	if annotations == nil {
-		return nil
-	}
-	inject, exists := annotations[SidecarInjectionAnnotation]
-	if !exists || inject != "true" {
+	if !sidecarInjectionRequested(annotations) {
 		return nil
 	}
 
-	// Inject sidecar into the Pod
-	r.injectAIBrixRuntime(deployment)
+	settings := runtimeSidecarSettingsFromAnnotations(annotations, annotations)
+	for _, warning := range injectRuntimeSidecar(&deployment.Spec.Template.Spec, settings) {
+		// The mutating admission response cannot carry warnings, so expose non-fatal
+		// problems through logs; the validating webhook surfaces them as admission warnings.
+		sidecarInjectionLog.Info(warning)
+	}
 
 	return nil
-}
-
-// injectAIBrixRuntime injects the aibrix-runtime sidecar into the Pod template of Deployment
-func (r *DeploymentCustomDefaulter) injectAIBrixRuntime(deployment *appsv1.Deployment) {
-	podSpec := &deployment.Spec.Template.Spec
-
-	// Get engine type from deployment template annotations, if specified
-	var engineType string
-	if annotations := deployment.GetAnnotations(); annotations != nil {
-		if engine, exists := annotations[constants.ModelLabelEngine]; exists && engine != "" {
-			engineType = engine
-		}
-	}
-
-	// Get sidecar image from deployment annotations; fall back to default if not set
-	var sidecarImage string
-	if annotations := deployment.GetAnnotations(); annotations != nil {
-		if image, exists := annotations[SidecarInjectionRuntimeImageAnnotation]; exists && image != "" {
-			sidecarImage = image
-		}
-	}
-	if sidecarImage == "" {
-		sidecarImage = SidecarImage // default
-	}
-
-	// Skip if sidecar already exists
-	if containsContainer(podSpec.Containers, SidecarName) {
-		return
-	}
-
-	// Infer engine type from primary containers if not set
-	if engineType == "" {
-		engineType = inferEngineType(podSpec.Containers)
-	}
-
-	// Ensure the artifacts download path is shared with the sidecar container
-	foundEmptyDirVolume := false
-	for i := range podSpec.Volumes {
-		v := &podSpec.Volumes[i]
-		if v.Name == DefaultAdapterVolumeName {
-			if v.EmptyDir == nil {
-				// Volume with same name exists but is not EmptyDir. Overwrite to ensure correct type.
-				v.VolumeSource = corev1.VolumeSource{
-					EmptyDir: &corev1.EmptyDirVolumeSource{},
-				}
-			}
-			foundEmptyDirVolume = true
-			break
-		}
-	}
-	if !foundEmptyDirVolume {
-		podSpec.Volumes = append(podSpec.Volumes, corev1.Volume{
-			Name: DefaultAdapterVolumeName,
-			VolumeSource: corev1.VolumeSource{
-				EmptyDir: &corev1.EmptyDirVolumeSource{},
-			},
-		})
-	}
-	for ci := range podSpec.Containers {
-		container := &podSpec.Containers[ci]
-		if container.Name == SidecarName {
-			continue
-		}
-		if !utils.HasVolumeMount(container.VolumeMounts, DefaultAdapterVolumeName, DefaultAdapterMountPath) {
-			container.VolumeMounts = append(container.VolumeMounts, corev1.VolumeMount{
-				Name:      DefaultAdapterVolumeName,
-				MountPath: DefaultAdapterMountPath,
-			})
-		}
-	}
-
-	// Build the sidecar container using shared logic
-	runtimeContainer := buildRuntimeSidecarContainer(sidecarImage, engineType)
-
-	// Inject sidecar at the beginning
-	podSpec.Containers = append([]corev1.Container{runtimeContainer}, podSpec.Containers...)
 }
 
 // TODO(user): change verbs to "verbs=create;update;delete" if you want to enable deletion validation.
@@ -150,16 +70,40 @@ func (r *DeploymentCustomDefaulter) injectAIBrixRuntime(deployment *appsv1.Deplo
 
 var _ webhook.CustomDefaulter = &DeploymentCustomDefaulter{}
 
+// validate checks the sidecar injection annotations and the pod template that injection
+// is enabled on. It is shared by ValidateCreate and ValidateUpdate.
+func (r *DeploymentCustomDefaulter) validate(deployment *appsv1.Deployment) (admission.Warnings, error) {
+	annotations := deployment.GetAnnotations()
+	warnings, err := validateSidecarInjectionSettings(annotations, annotations)
+	if err != nil {
+		return warnings, err
+	}
+	if !sidecarInjectionRequested(annotations) {
+		// Workloads that do not opt in are completely unaffected.
+		return warnings, nil
+	}
+
+	settings := runtimeSidecarSettingsFromAnnotations(annotations, annotations)
+	warnings = append(warnings, sidecarPodSpecWarnings(&deployment.Spec.Template.Spec, settings.engineType)...)
+	return warnings, nil
+}
+
 // ValidateCreate implements webhook.Validator so a webhook will be registered for the type
-func (r *DeploymentCustomDefaulter) ValidateCreate(ctx context.Context, obj runtime.Object) (admission.Warnings, error) {
-	// TODO(user): fill in your validation logic upon object creation.
-	return nil, nil
+func (r *DeploymentCustomDefaulter) ValidateCreate(_ context.Context, obj runtime.Object) (admission.Warnings, error) {
+	deployment, ok := obj.(*appsv1.Deployment)
+	if !ok {
+		return nil, fmt.Errorf("expected a Deployment object but got %T", obj)
+	}
+	return r.validate(deployment)
 }
 
 // ValidateUpdate implements webhook.Validator so a webhook will be registered for the type
-func (r *DeploymentCustomDefaulter) ValidateUpdate(_ context.Context, oldObj, newObj runtime.Object) (admission.Warnings, error) {
-	// TODO(user): fill in your validation logic upon object update.
-	return nil, nil
+func (r *DeploymentCustomDefaulter) ValidateUpdate(_ context.Context, _ runtime.Object, newObj runtime.Object) (admission.Warnings, error) {
+	deployment, ok := newObj.(*appsv1.Deployment)
+	if !ok {
+		return nil, fmt.Errorf("expected a Deployment object but got %T", newObj)
+	}
+	return r.validate(deployment)
 }
 
 // ValidateDelete implements webhook.Validator so a webhook will be registered for the type

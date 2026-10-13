@@ -282,20 +282,29 @@ func (w *StormServiceWrapper) WithSidecarInjection(runtimeImage string) *StormSe
 	for i := range w.stormService.Spec.Template.Spec.Roles {
 		role := &w.stormService.Spec.Template.Spec.Roles[i]
 
-		foundEmptyDirVolume := false
-		for vi := range role.Template.Spec.Volumes {
-			v := &role.Template.Spec.Volumes[vi]
-			if v.Name == webhook.DefaultAdapterVolumeName {
-				if v.EmptyDir == nil {
-					v.VolumeSource = corev1.VolumeSource{
-						EmptyDir: &corev1.EmptyDirVolumeSource{},
-					}
-				}
-				foundEmptyDirVolume = true
+		// Check if sidecar already exists to ensure idempotency; leave such a
+		// template completely untouched, mirroring the webhook behaviour.
+		var exists bool
+		for _, c := range role.Template.Spec.Containers {
+			if c.Name == webhook.SidecarName {
+				exists = true
 				break
 			}
 		}
-		if !foundEmptyDirVolume {
+		if exists {
+			continue
+		}
+
+		foundVolume := false
+		for vi := range role.Template.Spec.Volumes {
+			if role.Template.Spec.Volumes[vi].Name == webhook.DefaultAdapterVolumeName {
+				// Mirror the webhook: a pre-existing same-name volume keeps its
+				// declared source instead of being rewritten to an emptyDir.
+				foundVolume = true
+				break
+			}
+		}
+		if !foundVolume {
 			role.Template.Spec.Volumes = append(role.Template.Spec.Volumes, corev1.Volume{
 				Name: webhook.DefaultAdapterVolumeName,
 				VolumeSource: corev1.VolumeSource{
@@ -317,17 +326,6 @@ func (w *StormServiceWrapper) WithSidecarInjection(runtimeImage string) *StormSe
 			}
 		}
 
-		// Check if sidecar already exists to ensure idempotency.
-		var exists bool
-		for _, c := range role.Template.Spec.Containers {
-			if c.Name == webhook.SidecarName {
-				exists = true
-				break
-			}
-		}
-		if exists {
-			continue
-		}
 		// Prepend sidecar container
 		role.Template.Spec.Containers = append([]corev1.Container{sidecarContainer}, role.Template.Spec.Containers...)
 	}

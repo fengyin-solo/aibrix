@@ -35,12 +35,9 @@ type DeploymentWrapper struct {
 func (w *DeploymentWrapper) ensureAdapterStorageVolume() {
 	podSpec := &w.deployment.Spec.Template.Spec
 	for i := range podSpec.Volumes {
+		// Mirror the webhook: a pre-existing same-name volume keeps its source as
+		// declared (PVC, hostPath, ...) instead of being rewritten to an emptyDir.
 		if podSpec.Volumes[i].Name == webhook.DefaultAdapterVolumeName {
-			if podSpec.Volumes[i].EmptyDir == nil {
-				podSpec.Volumes[i].VolumeSource = corev1.VolumeSource{
-					EmptyDir: &corev1.EmptyDirVolumeSource{},
-				}
-			}
 			return
 		}
 	}

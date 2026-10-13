@@ -25,7 +25,6 @@ import (
 	"strings"
 
 	autoscalingv1 "k8s.io/api/autoscaling/v1"
-	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -39,8 +38,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	orchestrationv1alpha1 "github.com/vllm-project/aibrix/api/orchestration/v1alpha1"
-	"github.com/vllm-project/aibrix/pkg/constants"
-	"github.com/vllm-project/aibrix/pkg/utils"
 )
 
 const stormServiceScaleWebhookPath = "/validate-orchestration-aibrix-ai-v1alpha1-stormservice-scale"
@@ -116,8 +113,8 @@ func (r *StormServiceCustomDefaulter) Default(_ context.Context, obj runtime.Obj
 		return fmt.Errorf("expected a StormService object but got %T", obj)
 	}
 
-	// Only proceed if the sidecar injection annotation is present
-	if _, exists := stormService.GetAnnotations()[SidecarInjectionAnnotation]; !exists {
+	// Only proceed if the sidecar injection annotation is present and set to "true".
+	if !sidecarInjectionRequested(stormService.GetAnnotations()) {
 		return nil
 	}
 
@@ -126,95 +123,18 @@ func (r *StormServiceCustomDefaulter) Default(_ context.Context, obj runtime.Obj
 		return nil
 	}
 
-	// Inject sidecar into each role
-	r.injectAIBrixRuntime(stormService)
+	// Inject sidecar into each role through the same implementation as Deployment.
+	settings := runtimeSidecarSettingsFromAnnotations(stormService.GetAnnotations(), stormService.Spec.Template.Annotations)
+	for i := range stormService.Spec.Template.Spec.Roles {
+		role := &stormService.Spec.Template.Spec.Roles[i]
+		for _, warning := range injectRuntimeSidecar(&role.Template.Spec, settings) {
+			// The mutating admission response cannot carry warnings, so expose non-fatal
+			// problems through logs; the validating webhook surfaces them as admission warnings.
+			sidecarInjectionLog.Info(warning, "role", role.Name)
+		}
+	}
 
 	return nil
-}
-
-// injectAIBrixRuntime injects the aibrix-runtime sidecar into each Role's pod template
-func (r *StormServiceCustomDefaulter) injectAIBrixRuntime(stormService *orchestrationv1alpha1.StormService) {
-	spec := stormService.Spec.Template.Spec
-
-	// Get engine type from RoleSet template annotations, if specified
-	var engineType string
-	if annotations := stormService.Spec.Template.Annotations; annotations != nil {
-		if engine, exists := annotations[constants.ModelLabelEngine]; exists && engine != "" {
-			engineType = engine
-		}
-	}
-
-	// Get sidecar image from stormService annotations; fall back to default if not set
-	var sidecarImage string
-	if annotations := stormService.GetAnnotations(); annotations != nil {
-		if image, exists := annotations[SidecarInjectionRuntimeImageAnnotation]; exists && image != "" {
-			sidecarImage = image
-		}
-	}
-
-	if sidecarImage == "" {
-		sidecarImage = SidecarImage // default
-	}
-
-	for i := range spec.Roles {
-		role := &spec.Roles[i]
-
-		// Skip if sidecar already exists
-		if containsContainer(role.Template.Spec.Containers, SidecarName) {
-			continue
-		}
-
-		currentEngineType := engineType
-		if currentEngineType == "" {
-			// fallback：get inference engine from primary containers
-			currentEngineType = inferEngineType(role.Template.Spec.Containers)
-		}
-
-		// Ensure the artifacts download path is shared with the sidecar container
-		foundEmptyDirVolume := false
-		for i := range role.Template.Spec.Volumes {
-			v := &role.Template.Spec.Volumes[i]
-			if v.Name == DefaultAdapterVolumeName {
-				if v.EmptyDir == nil {
-					// Volume with same name exists but is not EmptyDir. Overwrite to ensure correct type.
-					v.VolumeSource = corev1.VolumeSource{
-						EmptyDir: &corev1.EmptyDirVolumeSource{},
-					}
-				}
-				foundEmptyDirVolume = true
-				break
-			}
-		}
-		if !foundEmptyDirVolume {
-			role.Template.Spec.Volumes = append(role.Template.Spec.Volumes, corev1.Volume{
-				Name: DefaultAdapterVolumeName,
-				VolumeSource: corev1.VolumeSource{
-					EmptyDir: &corev1.EmptyDirVolumeSource{},
-				},
-			})
-		}
-		for ci := range role.Template.Spec.Containers {
-			container := &role.Template.Spec.Containers[ci]
-			if container.Name == SidecarName {
-				continue
-			}
-			if !utils.HasVolumeMount(container.VolumeMounts, DefaultAdapterVolumeName, DefaultAdapterMountPath) {
-				container.VolumeMounts = append(container.VolumeMounts, corev1.VolumeMount{
-					Name:      DefaultAdapterVolumeName,
-					MountPath: DefaultAdapterMountPath,
-				})
-			}
-		}
-
-		// Build the sidecar container using shared logic
-		runtimeContainer := buildRuntimeSidecarContainer(sidecarImage, currentEngineType)
-
-		// Inject sidecar at the beginning
-		role.Template.Spec.Containers = append(
-			[]corev1.Container{runtimeContainer},
-			role.Template.Spec.Containers...,
-		)
-	}
 }
 
 // TODO(user): change verbs to "verbs=create;update;delete" if you want to enable deletion validation.
@@ -227,6 +147,29 @@ var _ webhook.CustomDefaulter = &StormServiceCustomDefaulter{}
 // e.g., <stormservice>-<revision>-<role>-<hash>-<index>
 const estimatedPodNameSuffixLength = 36
 
+// validateStormServiceSidecarInjection validates the sidecar injection annotations and
+// inspects every role template that the shared injection logic runs against. Per-role
+// warnings are prefixed with the role name. It is a no-op for StormServices that do
+// not opt into injection.
+func validateStormServiceSidecarInjection(stormService *orchestrationv1alpha1.StormService) (admission.Warnings, error) {
+	annotations := stormService.GetAnnotations()
+	warnings, err := validateSidecarInjectionSettings(annotations, stormService.Spec.Template.Annotations)
+	if err != nil {
+		return warnings, err
+	}
+	if !sidecarInjectionRequested(annotations) || stormService.Spec.Template.Spec == nil {
+		return warnings, nil
+	}
+	settings := runtimeSidecarSettingsFromAnnotations(annotations, stormService.Spec.Template.Annotations)
+	for i := range stormService.Spec.Template.Spec.Roles {
+		role := &stormService.Spec.Template.Spec.Roles[i]
+		for _, warning := range sidecarPodSpecWarnings(&role.Template.Spec, settings.engineType) {
+			warnings = append(warnings, fmt.Sprintf("role %q: %s", role.Name, warning))
+		}
+	}
+	return warnings, nil
+}
+
 // ValidateCreate implements webhook.Validator so a webhook will be registered for the type
 func (r *StormServiceCustomDefaulter) ValidateCreate(ctx context.Context, obj runtime.Object) (admission.Warnings, error) {
 	stormService, ok := obj.(*orchestrationv1alpha1.StormService)
@@ -234,16 +177,21 @@ func (r *StormServiceCustomDefaulter) ValidateCreate(ctx context.Context, obj ru
 		return nil, fmt.Errorf("expected a StormService object but got %T", obj)
 	}
 
+	warnings, err := validateStormServiceSidecarInjection(stormService)
+	if err != nil {
+		return warnings, err
+	}
+
 	if err := validateStormServiceMode(stormService); err != nil {
-		return nil, err
+		return warnings, err
 	}
 	if err := validateStormServiceSchedulingStrategy(stormService); err != nil {
-		return nil, err
+		return warnings, err
 	}
 
 	// 1. Validate StormService.Name itself (≤63, DNS-1123 compliant)
 	if len(stormService.Name) > 63 {
-		return nil, fmt.Errorf("StormService name must be no more than 63 characters")
+		return warnings, fmt.Errorf("StormService name must be no more than 63 characters")
 	}
 
 	// 2. Only validate roles that actually create PodSet (i.e., PodGroupSize > 1)
@@ -264,14 +212,14 @@ func (r *StormServiceCustomDefaulter) ValidateCreate(ctx context.Context, obj ru
 		// PodSet: <roleSet.Name>-<roleName>-<hash(6)>-99999 → ≈ N + M + 36
 		estimatedPodSetNameLen := len(stormService.Name) + maxPodSetRoleNameLen + estimatedPodNameSuffixLength
 		if estimatedPodSetNameLen > 63 {
-			return nil, fmt.Errorf(
+			return warnings, fmt.Errorf(
 				"combined length of StormService name (%d) and longest PodSet-enabled role name (%d) may produce PodSet names exceeding 63 characters (estimated: %d). Please use shorter names",
 				len(stormService.Name), maxPodSetRoleNameLen, estimatedPodSetNameLen,
 			)
 		}
 	}
 
-	return nil, nil
+	return warnings, nil
 }
 
 // ValidateUpdate implements webhook.Validator so a webhook will be registered for the type
@@ -280,8 +228,12 @@ func (r *StormServiceCustomDefaulter) ValidateUpdate(_ context.Context, oldObj, 
 	if !ok {
 		return nil, fmt.Errorf("expected a StormService object but got %T", newObj)
 	}
+	warnings, err := validateStormServiceSidecarInjection(stormService)
+	if err != nil {
+		return warnings, err
+	}
 	if err := validateStormServiceMode(stormService); err != nil {
-		return nil, err
+		return warnings, err
 	}
 	// Re-run the scheduling validation only when one of its inputs changed; its result cannot
 	// differ otherwise. Objects that predate this validation must keep accepting unrelated
@@ -291,10 +243,10 @@ func (r *StormServiceCustomDefaulter) ValidateUpdate(_ context.Context, oldObj, 
 	oldStormService, ok := oldObj.(*orchestrationv1alpha1.StormService)
 	if !ok || schedulingConfigChanged(oldStormService.Spec.Template.Spec, stormService.Spec.Template.Spec) {
 		if err := validateStormServiceSchedulingStrategy(stormService); err != nil {
-			return nil, err
+			return warnings, err
 		}
 	}
-	return nil, nil
+	return warnings, nil
 }
 
 // schedulingConfigChanged reports whether any input of validateRoleSetSchedulingStrategy differs

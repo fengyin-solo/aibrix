@@ -30,6 +30,8 @@ import (
 	"context"
 	stderrors "errors"
 	"fmt"
+	"math"
+	"strings"
 	"sync"
 	"time"
 
@@ -37,6 +39,7 @@ import (
 	orchestrationv1alpha1 "github.com/vllm-project/aibrix/api/orchestration/v1alpha1"
 	"github.com/vllm-project/aibrix/pkg/config"
 	scalingctx "github.com/vllm-project/aibrix/pkg/controller/podautoscaler/context"
+	"github.com/vllm-project/aibrix/pkg/controller/podautoscaler/decision"
 	"github.com/vllm-project/aibrix/pkg/controller/podautoscaler/metrics"
 	"github.com/vllm-project/aibrix/pkg/controller/podautoscaler/monitor"
 	podutils "github.com/vllm-project/aibrix/pkg/utils"
@@ -79,11 +82,12 @@ const (
 )
 
 const (
-	ConditionReady         = "Ready"
-	ConditionValidSpec     = "ValidSpec"
-	ConditionConflict      = "MultiPodAutoscalerConflict"
-	ConditionScalingActive = "ScalingActive"
-	ConditionAbleToScale   = "AbleToScale"
+	ConditionReady           = "Ready"
+	ConditionValidSpec       = "ValidSpec"
+	ConditionConflict        = "MultiPodAutoscalerConflict"
+	ConditionScalingActive   = "ScalingActive"
+	ConditionAbleToScale     = "AbleToScale"
+	ConditionConfidenceGuard = "ConfidenceGuard"
 
 	ReasonAsExpected                = "AsExpected"
 	ReasonReconcilingScaleDiff      = "ReconcilingScaleDiff"
@@ -95,6 +99,8 @@ const (
 	ReasonInvalidSpec               = "InvalidSpec"
 	ReasonConfigured                = "Configured"
 	ReasonPendingReplicas           = "PendingReplicas"
+	ReasonConfidenceQualified       = "ConfidenceQualified"
+	ReasonLowConfidence             = "LowConfidenceSuppressed"
 	maxScalingHistorySize           = 5
 	minScalingHistoryRecordInterval = 5 * time.Second
 	maxMetricWindowSeconds          = int64(3600)
@@ -884,7 +890,7 @@ func (r *PodAutoscalerReconciler) reconcileCustomPA(ctx context.Context, pa auto
 	// Pass ScaleTargetRef to handle special cases like RayClusterFleet
 	scaleDecision, err := r.computeScaleDecision(ctx, pa, scaleObj, currentReplicas)
 	if err != nil {
-		setStatus(&pa, currentReplicas, currentReplicas, false, "FailedComputeScale", false, false, err)
+		setStatus(&pa, currentReplicas, currentReplicas, false, "FailedComputeScale", false, false, err, nil)
 		if updateErr := r.updateStatusIfNeeded(ctx, paStatusOriginal, &pa); updateErr != nil {
 			return ctrl.Result{}, updateErr
 		}
@@ -923,7 +929,7 @@ func (r *PodAutoscalerReconciler) reconcileCustomPA(ctx context.Context, pa auto
 
 	// Step 5: Update status
 	setStatus(&pa, currentReplicas, scaleDecision.DesiredReplicas,
-		scaleDecision.ShouldScale, scaleDecision.Reason, scaleDecision.PendingReplicaGuardActive, scaleError == nil, scaleError)
+		scaleDecision.ShouldScale, scaleDecision.Reason, scaleDecision.PendingReplicaGuardActive, scaleError == nil, scaleError, scaleDecision.Decision)
 
 	if err := r.updateStatusIfNeeded(ctx, paStatusOriginal, &pa); err != nil {
 		return ctrl.Result{}, err
@@ -999,8 +1005,10 @@ func setCondition(pa *autoscalingv1alpha1.PodAutoscaler, conditionType string, s
 }
 
 // setStatus recreates the status of the given PA, updating the current and
-// desired replicas, as well as the metric statuses and optionally records a scaling decision
-func setStatus(pa *autoscalingv1alpha1.PodAutoscaler, currentReplicas, desiredReplicas int32, rescale bool, reason string, pendingGuardActive bool, success bool, err error) {
+// desired replicas, as well as the metric statuses and optionally records a scaling decision.
+// When details is non-nil, the scaling history and ConfidenceGuard condition record
+// the active metric, confidence, trend and suppression reasons.
+func setStatus(pa *autoscalingv1alpha1.PodAutoscaler, currentReplicas, desiredReplicas int32, rescale bool, reason string, pendingGuardActive bool, success bool, err error, details *decision.Outcome) {
 	pa.Status = autoscalingv1alpha1.PodAutoscalerStatus{
 		ActualScale:     currentReplicas,
 		DesiredScale:    desiredReplicas,
@@ -1023,7 +1031,20 @@ func setStatus(pa *autoscalingv1alpha1.PodAutoscaler, currentReplicas, desiredRe
 	}
 	setCondition(pa, ConditionScalingActive, boolToCond(scalingActive), scalingReason, scalingMessage)
 
-	if rescale || !success {
+	// Surface confidence/trend diagnostics as a dedicated condition.
+	if details != nil && details.Enabled {
+		if details.Suppressed {
+			setCondition(pa, ConditionConfidenceGuard, metav1.ConditionFalse, ReasonLowConfidence, "%s", details.Summary)
+		} else {
+			setCondition(pa, ConditionConfidenceGuard, metav1.ConditionTrue, ReasonConfidenceQualified, "%s", details.Summary)
+		}
+	} else {
+		// Feature disabled or HPA path: drop any stale guard condition.
+		apimeta.RemoveStatusCondition(&pa.Status.Conditions, ConditionConfidenceGuard)
+	}
+
+	suppressedEvent := details != nil && details.Enabled && details.Suppressed
+	if rescale || !success || suppressedEvent {
 		now := metav1.NewTime(time.Now())
 
 		// Check if this is a genuine scaling event or just a quick follow-up reconciliation
@@ -1036,18 +1057,26 @@ func setStatus(pa *autoscalingv1alpha1.PodAutoscaler, currentReplicas, desiredRe
 			// 1. More than minScalingHistoryRecordInterval have passed since last scaling decision, or
 			// 2. The desired scale is different from the last recorded scale, or
 			// 3. The success status has changed (success to failure or vice versa), or
-			// 4. There's a different error message
+			// 4. There's a different error message, or
+			// 5. The suppression state or its reason changed
 			timeSinceLastScale := now.Sub(lastScale.Timestamp.Time)
 			if timeSinceLastScale > minScalingHistoryRecordInterval ||
 				lastScale.NewScale != desiredReplicas ||
 				lastScale.Success != success ||
-				(err != nil && lastScale.Error != err.Error()) {
+				(err != nil && lastScale.Error != err.Error()) ||
+				lastScale.Suppressed != suppressedEvent {
 				shouldRecordHistory = true
+			}
+			// Repeated identical hold decisions caused by suppression must
+			// not evict real scaling events from the bounded history.
+			if suppressedEvent && lastScale.Suppressed && lastScale.NewScale == desiredReplicas &&
+				timeSinceLastScale <= minScalingHistoryRecordInterval {
+				shouldRecordHistory = false
 			}
 		}
 		if shouldRecordHistory {
 			pa.Status.LastScaleTime = &now
-			decision := autoscalingv1alpha1.ScalingDecision{
+			scalingDecision := autoscalingv1alpha1.ScalingDecision{
 				Timestamp:     metav1.Now(),
 				PreviousScale: currentReplicas,
 				NewScale:      desiredReplicas,
@@ -1055,7 +1084,10 @@ func setStatus(pa *autoscalingv1alpha1.PodAutoscaler, currentReplicas, desiredRe
 				Success:       success,
 			}
 			if err != nil {
-				decision.Error = err.Error()
+				scalingDecision.Error = err.Error()
+			}
+			if details != nil && details.Enabled {
+				fillDecisionDetails(&scalingDecision, details)
 			}
 			// First trim if at maximum size
 			if len(pa.Status.ScalingHistory) >= maxScalingHistorySize {
@@ -1063,10 +1095,56 @@ func setStatus(pa *autoscalingv1alpha1.PodAutoscaler, currentReplicas, desiredRe
 			}
 
 			// Then append the new decision
-			pa.Status.ScalingHistory = append(pa.Status.ScalingHistory, decision)
+			pa.Status.ScalingHistory = append(pa.Status.ScalingHistory, scalingDecision)
 		}
 
 	}
+}
+
+// fillDecisionDetails populates the confidence/trend diagnostic fields of a
+// scaling history entry from a decision outcome. Fractional values are
+// expressed as integer percentages for the CRD schema.
+func fillDecisionDetails(entry *autoscalingv1alpha1.ScalingDecision, details *decision.Outcome) {
+	entry.Metric = details.Representative
+	entry.Suppressed = details.Suppressed
+
+	var suppressionReasons []string
+	contributions := make([]autoscalingv1alpha1.MetricContribution, 0, len(details.Metrics)+len(details.MissingMetrics))
+	for _, md := range details.Metrics {
+		if md.MetricName == details.Representative {
+			entry.Confidence = toPercent(md.Confidence)
+			entry.Trend = toPercent(md.Trend)
+		}
+		if md.SuppressionReason != "" {
+			suppressionReasons = append(suppressionReasons, fmt.Sprintf("%s: %s", md.MetricName, md.SuppressionReason))
+		}
+		contributions = append(contributions, autoscalingv1alpha1.MetricContribution{
+			Metric:            md.MetricName,
+			DesiredReplicas:   md.AdjustedDesired,
+			Confidence:        toPercent(md.Confidence),
+			Trend:             toPercent(md.Trend),
+			Weight:            toPercent(md.Weight),
+			Qualified:         md.Qualified,
+			SuppressionReason: md.SuppressionReason,
+		})
+	}
+	for _, missing := range details.MissingMetrics {
+		suppressionReasons = append(suppressionReasons, fmt.Sprintf("%s: metric unavailable", missing))
+		contributions = append(contributions, autoscalingv1alpha1.MetricContribution{
+			Metric:            missing,
+			DesiredReplicas:   details.CurrentReplicas,
+			Qualified:         false,
+			SuppressionReason: "metric unavailable",
+		})
+	}
+	entry.SuppressionReason = strings.Join(suppressionReasons, "; ")
+	entry.MetricContributions = contributions
+}
+
+// toPercent converts a [0,1] fraction to an integer percentage, allowing
+// trend values outside the unit interval.
+func toPercent(value float64) int32 {
+	return int32(math.Round(value * 100))
 }
 
 func (r *PodAutoscalerReconciler) updateStatusIfNeeded(ctx context.Context, oldStatus *autoscalingv1alpha1.PodAutoscalerStatus, newPA *autoscalingv1alpha1.PodAutoscaler) error {
@@ -1110,6 +1188,9 @@ type ScaleDecision struct {
 	Reason                    string
 	Algorithm                 string
 	PendingReplicaGuardActive bool
+	// Decision carries confidence/trend diagnostics when confidence-aware
+	// scaling is enabled; nil otherwise.
+	Decision *decision.Outcome
 }
 
 // getScaleResource retrieves the scale resource for the PodAutoscaler target
@@ -1242,6 +1323,7 @@ func (r *PodAutoscalerReconciler) computeScaleDecision(
 		Reason:                    reason,
 		Algorithm:                 metricName,
 		PendingReplicaGuardActive: pendingGuardActive,
+		Decision:                  replicaResult.Decision,
 	}, nil
 }
 

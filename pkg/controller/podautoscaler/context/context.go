@@ -22,6 +22,7 @@ import (
 	"time"
 
 	autoscalingv1alpha1 "github.com/vllm-project/aibrix/api/autoscaling/v1alpha1"
+	"github.com/vllm-project/aibrix/pkg/controller/podautoscaler/decision"
 	"github.com/vllm-project/aibrix/pkg/controller/podautoscaler/types"
 	"k8s.io/klog/v2"
 )
@@ -53,6 +54,12 @@ type ScalingContext interface {
 	GetScaleUpCooldownWindow() time.Duration
 	GetScaleDownCooldownWindow() time.Duration
 	GetScaleToZero() bool
+	// GetConfidenceAwareScalingEnabled reports whether confidence and trend
+	// aware scaling decisions are enabled for this PodAutoscaler.
+	GetConfidenceAwareScalingEnabled() bool
+	// GetConfidenceThreshold returns the minimum [0,1] confidence required
+	// for a metric source recommendation to drive scaling.
+	GetConfidenceThreshold() float64
 }
 
 // baseScalingContext provides a base implementation of the ScalingContext interface.
@@ -79,6 +86,10 @@ type baseScalingContext struct {
 	ScaleToZero bool
 	// Panic threshold for KPA
 	PanicThreshold float64
+	// ConfidenceAwareScaling toggles confidence/trend aware decisions
+	ConfidenceAwareScaling bool
+	// ConfidenceThreshold is the minimum confidence for a recommendation
+	ConfidenceThreshold float64
 
 	// Stable and Panic values
 	StableValue float64
@@ -113,6 +124,8 @@ func NewBaseScalingContext() *baseScalingContext {
 		ScaleDownCooldownWindow:  300 * time.Second, // Default: 5 minutes cooldown for scale-down
 		ScaleToZero:              false,             // Default: do not scale to zero
 		PanicThreshold:           2.0,               // Default panic threshold for KPA
+		ConfidenceAwareScaling:   false,             // Default: keep historical scaling behavior
+		ConfidenceThreshold:      decision.DefaultConfidenceThreshold,
 		MetricTargets:            make(map[string]MetricTarget),
 	}
 }
@@ -177,6 +190,24 @@ var annotationParsers = map[string]annotationParser{
 			b.ScaleToZero = v
 		}
 		return err
+	},
+	types.ConfidenceAwareScalingLabel: func(b *baseScalingContext, value string) error {
+		v, err := strconv.ParseBool(value)
+		if err == nil {
+			b.ConfidenceAwareScaling = v
+		}
+		return err
+	},
+	types.ConfidenceThresholdLabel: func(b *baseScalingContext, value string) error {
+		v, err := strconv.ParseFloat(value, 64)
+		if err != nil {
+			return err
+		}
+		if v < 0 || v > 1 {
+			return fmt.Errorf("confidence threshold must be within [0,1], got %f", v)
+		}
+		b.ConfidenceThreshold = v
+		return nil
 	},
 }
 
@@ -316,4 +347,15 @@ func (b *baseScalingContext) GetScaleDownCooldownWindow() time.Duration {
 
 func (b *baseScalingContext) GetScaleToZero() bool {
 	return b.ScaleToZero
+}
+
+func (b *baseScalingContext) GetConfidenceAwareScalingEnabled() bool {
+	return b.ConfidenceAwareScaling
+}
+
+func (b *baseScalingContext) GetConfidenceThreshold() float64 {
+	if b.ConfidenceThreshold <= 0 {
+		return decision.DefaultConfidenceThreshold
+	}
+	return b.ConfidenceThreshold
 }

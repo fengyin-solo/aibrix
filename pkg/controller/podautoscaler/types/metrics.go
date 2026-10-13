@@ -45,6 +45,11 @@ type WindowStats struct {
 	LastUpdate  time.Time
 	WindowStart time.Time
 	WindowEnd   time.Time
+	// Values holds the window samples in chronological order. It is nil for
+	// history-backed stats and populated for stats derived from TimeWindow.
+	Values []float64
+	// Timestamps holds the sample timestamps aligned with Values.
+	Timestamps []time.Time
 }
 
 // MetricPoint represents a single metric measurement
@@ -273,4 +278,28 @@ func (tw *TimeWindow) Values() []float64 {
 	tw.mu.RLock()
 	defer tw.mu.RUnlock()
 	return tw.values
+}
+
+// Timestamps returns all sample timestamps in the window in chronological order
+func (tw *TimeWindow) Timestamps() []time.Time {
+	tw.mu.RLock()
+	defer tw.mu.RUnlock()
+
+	if len(tw.buckets) == 0 {
+		return nil
+	}
+
+	bucketKeys := make([]int64, 0, len(tw.buckets))
+	for b := range tw.buckets {
+		bucketKeys = append(bucketKeys, b)
+	}
+	sort.Slice(bucketKeys, func(i, j int) bool {
+		return bucketKeys[i] < bucketKeys[j]
+	})
+
+	timestamps := make([]time.Time, 0, len(bucketKeys))
+	for _, b := range bucketKeys {
+		timestamps = append(timestamps, time.Unix(0, b*int64(tw.granularity)))
+	}
+	return timestamps
 }

@@ -28,6 +28,7 @@ import (
 	"github.com/vllm-project/aibrix/pkg/controller/podautoscaler/aggregation"
 	"github.com/vllm-project/aibrix/pkg/controller/podautoscaler/algorithm"
 	scalingctx "github.com/vllm-project/aibrix/pkg/controller/podautoscaler/context"
+	"github.com/vllm-project/aibrix/pkg/controller/podautoscaler/decision"
 	"github.com/vllm-project/aibrix/pkg/controller/podautoscaler/metrics"
 	"github.com/vllm-project/aibrix/pkg/controller/podautoscaler/types"
 	corev1 "k8s.io/api/core/v1"
@@ -73,6 +74,12 @@ type ReplicaComputeResult struct {
 	Reason                    string
 	Valid                     bool
 	PendingReplicaGuardActive bool
+	// ReportingPods is the number of scraped pods that returned a value in
+	// the latest cycle, used for sample coverage confidence.
+	ReportingPods int
+	// Decision carries confidence/trend diagnostics. It is nil when
+	// confidence-aware scaling is disabled.
+	Decision *decision.Outcome
 }
 
 // DefaultAutoScaler implements the complete scaling pipeline
@@ -87,6 +94,9 @@ type DefaultAutoScaler struct {
 	// Algorithm cache (algorithms are stateless structs, can be safely reused)
 	mu             sync.RWMutex
 	algorithmCache map[autoscalingv1alpha1.ScalingStrategyType]algorithm.ScalingAlgorithm
+
+	// guard holds recent stable recommendations for confidence-aware decisions
+	guard *decision.Guard
 }
 
 // NewDefaultAutoScaler creates a new default autoscaler
@@ -107,6 +117,7 @@ func NewDefaultAutoScaler(
 		metricsClient:  metricsClient,
 		aggregator:     aggregator,
 		algorithmCache: make(map[autoscalingv1alpha1.ScalingStrategyType]algorithm.ScalingAlgorithm),
+		guard:          decision.NewGuard(),
 	}
 }
 
@@ -137,7 +148,10 @@ func (a *DefaultAutoScaler) getOrCreateAlgorithm(strategy autoscalingv1alpha1.Sc
 }
 
 // ComputeDesiredReplicas computes desired replicas based on all metrics in MetricsSources.
-// It returns the maximum recommended replicas across all valid metrics.
+// When confidence-aware scaling is disabled it returns the maximum recommended
+// replicas across all valid metrics (historical behavior). When enabled,
+// qualified metric sources cast confidence-weighted votes while low-confidence
+// sources may only converge to the current or last stable recommendation.
 func (a *DefaultAutoScaler) ComputeDesiredReplicas(ctx context.Context, request ReplicaComputeRequest) (*ReplicaComputeResult, error) {
 	pa := request.PodAutoscaler
 	metricsSources := pa.Spec.MetricsSources
@@ -146,7 +160,12 @@ func (a *DefaultAutoScaler) ComputeDesiredReplicas(ctx context.Context, request 
 		return &ReplicaComputeResult{Valid: false}, fmt.Errorf(
 			"no metricsSources defined in PodAutoscaler %s/%s", pa.Namespace, pa.Name)
 	}
+
+	confidenceAware := request.ScalingContext.GetConfidenceAwareScalingEnabled()
+
 	var validResults []*ReplicaComputeResult // to record the recommended result calculated in the current round
+	var observations []decision.MetricObservation
+	var missingMetrics []string
 	var anyValid bool
 
 	for _, metricSource := range metricsSources {
@@ -166,6 +185,9 @@ func (a *DefaultAutoScaler) ComputeDesiredReplicas(ctx context.Context, request 
 				"metric", metricSource.TargetMetric,
 				"metricSourceType", metricSource.MetricSourceType)
 			// Continue processing other metrics — one failure shouldn't block all
+			if confidenceAware {
+				missingMetrics = append(missingMetrics, metricSource.TargetMetric)
+			}
 			continue
 		}
 
@@ -180,6 +202,10 @@ func (a *DefaultAutoScaler) ComputeDesiredReplicas(ctx context.Context, request 
 				"reason", result.Reason,
 				"currentReplicas", request.CurrentReplicas,
 			)
+			if confidenceAware {
+				observations = append(observations,
+					a.buildMetricObservation(request, metricKey, metricSource, result))
+			}
 		}
 	}
 
@@ -188,39 +214,130 @@ func (a *DefaultAutoScaler) ComputeDesiredReplicas(ctx context.Context, request 
 			"PodAutoscaler %s/%s", len(metricsSources), pa.Namespace, pa.Name)
 	}
 
-	// compare the recommended values of the current round and use the maximum value
-	bestResult := validResults[0]
-	for _, r := range validResults[1:] {
-		if r.DesiredReplicas > bestResult.DesiredReplicas {
-			bestResult = r
+	var bestResult *ReplicaComputeResult
+	var outcome *decision.Outcome
+
+	if confidenceAware {
+		paKey := fmt.Sprintf("%s/%s", pa.Namespace, pa.Name)
+		outcome = a.guard.Decide(
+			paKey,
+			request.CurrentReplicas,
+			request.ScalingContext.GetConfidenceThreshold(),
+			request.Timestamp,
+			observations,
+			missingMetrics,
+		)
+
+		representative := findResultByMetric(validResults, outcome.Representative)
+		klog.V(2).InfoS("Confidence-aware autoscaling computed result",
+			"podAutoscaler", klog.KObj(&pa),
+			"desiredReplicas", outcome.DesiredReplicas,
+			"suppressed", outcome.Suppressed,
+			"qualifiedCount", outcome.QualifiedCount,
+			"currentReplicas", request.CurrentReplicas,
+			"summary", outcome.Summary,
+		)
+		bestResult = &ReplicaComputeResult{
+			DesiredReplicas:  outcome.DesiredReplicas,
+			Algorithm:        representative.Algorithm,
+			MetricName:       representative.MetricName,
+			MetricSourceType: representative.MetricSourceType,
+			MetricValue:      representative.MetricValue,
+			Reason:           outcome.Summary,
+			Valid:            true,
+			Decision:         outcome,
+		}
+	} else {
+		// compare the recommended values of the current round and use the maximum value
+		bestResult = validResults[0]
+		for _, r := range validResults[1:] {
+			if r.DesiredReplicas > bestResult.DesiredReplicas {
+				bestResult = r
+			}
+		}
+
+		allValidReplicas := make([]int32, len(validResults))
+		for i, res := range validResults {
+			allValidReplicas[i] = res.DesiredReplicas
+		}
+
+		klog.V(2).InfoS("Multi metric autoscaling computed result",
+			"podAutoscaler", klog.KObj(&pa),
+			"metricCount", len(allValidReplicas),
+			"desiredReplicas", bestResult.DesiredReplicas,
+			"validDesiredReplicas", allValidReplicas,
+			"currentReplicas", request.CurrentReplicas,
+		)
+
+		bestResult = &ReplicaComputeResult{
+			DesiredReplicas:           bestResult.DesiredReplicas,
+			Algorithm:                 bestResult.Algorithm,
+			MetricName:                bestResult.MetricName,
+			MetricSourceType:          bestResult.MetricSourceType,
+			MetricValue:               bestResult.MetricValue,
+			Reason:                    bestResult.Reason,
+			Valid:                     true,
+			PendingReplicaGuardActive: bestResult.PendingReplicaGuardActive,
 		}
 	}
 
-	allValidReplicas := make([]int32, len(validResults))
-	for i, res := range validResults {
-		allValidReplicas[i] = res.DesiredReplicas
+	bestResult = applyPendingReplicaGuard(request, bestResult)
+	bestResult.Decision = outcome
+
+	return bestResult, nil
+}
+
+// findResultByMetric returns the valid result for the given metric name, or
+// the first result when the name cannot be matched.
+func findResultByMetric(results []*ReplicaComputeResult, metricName string) *ReplicaComputeResult {
+	for _, r := range results {
+		if r.MetricName == metricName {
+			return r
+		}
+	}
+	return results[0]
+}
+
+// buildMetricObservation scores one metric source and pairs it with the raw
+// algorithm recommendation for the confidence-aware decision guard.
+func (a *DefaultAutoScaler) buildMetricObservation(
+	request ReplicaComputeRequest,
+	metricKey types.MetricKey,
+	metricSource autoscalingv1alpha1.MetricSource,
+	result *ReplicaComputeResult,
+) decision.MetricObservation {
+	stableWindow, _ := metricWindowDurations(request.PodAutoscaler)
+
+	stableStats, panicStats, err := a.metricsClient.GetUnifiedStats(metricKey, request.Timestamp)
+	if err != nil {
+		klog.V(4).InfoS("No window stats available for confidence evaluation",
+			"metricKey", metricKey.String(), "err", err)
+		stableStats = types.WindowStats{}
+		panicStats = types.WindowStats{}
 	}
 
-	klog.V(2).InfoS("Multi metric autoscaling computed result",
-		"podAutoscaler", klog.KObj(&pa),
-		"metricCount", len(allValidReplicas),
-		"desiredReplicas", bestResult.DesiredReplicas,
-		"validDesiredReplicas", allValidReplicas,
-		"currentReplicas", request.CurrentReplicas,
-	)
+	podScoped := metricSource.MetricSourceType != autoscalingv1alpha1.EXTERNAL &&
+		metricSource.MetricSourceType != autoscalingv1alpha1.DOMAIN
 
-	bestResult = applyPendingReplicaGuard(request, bestResult)
+	report := decision.EvaluateSource(decision.SourceInput{
+		MetricName:      metricSource.TargetMetric,
+		PodScoped:       podScoped,
+		CurrentReplicas: request.CurrentReplicas,
+		ReadyReplicas:   request.ReplicaState.ReadyReplicas,
+		PendingReplicas: request.ReplicaState.PendingReplicas,
+		ExpectedPods:    len(request.Pods),
+		ReportingPods:   result.ReportingPods,
+		StableStats:     stableStats,
+		StableWindow:    stableWindow,
+		PanicStats:      panicStats,
+	}, request.Timestamp)
 
-	return &ReplicaComputeResult{
-		DesiredReplicas:           bestResult.DesiredReplicas,
-		Algorithm:                 bestResult.Algorithm,
-		MetricName:                bestResult.MetricName,
-		MetricSourceType:          bestResult.MetricSourceType,
-		MetricValue:               bestResult.MetricValue,
-		Reason:                    bestResult.Reason,
-		Valid:                     true,
-		PendingReplicaGuardActive: bestResult.PendingReplicaGuardActive,
-	}, nil
+	return decision.MetricObservation{
+		MetricKey:  metricKey.String(),
+		MetricName: metricSource.TargetMetric,
+		RawDesired: result.DesiredReplicas,
+		Report:     report,
+	}
 }
 
 func applyPendingReplicaGuard(request ReplicaComputeRequest, result *ReplicaComputeResult) *ReplicaComputeResult {
@@ -356,7 +473,30 @@ func (a *DefaultAutoScaler) computeReplicasForSingleMetric(
 		MetricValue:      recommendationMetricValue(recommendation),
 		Reason:           recommendation.Reason,
 		Valid:            true,
+		ReportingPods:    int(recommendationIntMetadata(recommendation, "reporting_pods")),
 	}, nil
+}
+
+// recommendationIntMetadata extracts an integer metadata value from a
+// recommendation, supporting common numeric types.
+func recommendationIntMetadata(recommendation *algorithm.ScalingRecommendation, key string) int64 {
+	if recommendation == nil || recommendation.Metadata == nil {
+		return 0
+	}
+	switch value := recommendation.Metadata[key].(type) {
+	case int:
+		return int64(value)
+	case int32:
+		return int64(value)
+	case int64:
+		return value
+	case float64:
+		return int64(value)
+	case float32:
+		return int64(value)
+	default:
+		return 0
+	}
 }
 
 func recommendationMetricValue(recommendation *algorithm.ScalingRecommendation) float64 {
@@ -430,16 +570,9 @@ func (a *DefaultAutoScaler) executeScalingPipeline(
 		return nil, fmt.Errorf("failed to get aggregated metrics for %s %s: %w", workloadKey, metricKey, err)
 	}
 
-	// Step 3: Enhance confidence with pod count awareness
-	// TODO: enable confidence and pod count later
-	//podCount := len(request.Pods)
-	//if podCount > 0 {
-	//	// Simple pod-aware confidence enhancement
-	//	// More pods = higher confidence (diminishing returns)
-	//	podConfidenceFactor := minFloat64(1.0, float64(podCount)/5.0)
-	//	aggregatedMetrics.Confidence = minFloat64(1.0, aggregatedMetrics.Confidence*0.7+podConfidenceFactor*0.3)
-	//}
-
+	// Step 3: confidence and trend are computed by the decision layer after
+	// the algorithm produces its raw recommendation; the aggregator values
+	// are passed through unchanged here.
 	klog.InfoS("Metrics aggregated",
 		"averageValue", aggregatedMetrics.StableValue,
 		"trend", aggregatedMetrics.Trend,
@@ -467,6 +600,13 @@ func (a *DefaultAutoScaler) executeScalingPipeline(
 	if err != nil {
 		return nil, fmt.Errorf("failed to compute scaling recommendation for %s: %w", workloadKey, err)
 	}
+	// Record cross-sectional sample coverage from the latest scrape so the
+	// decision layer can score sample coverage confidence.
+	if recommendation.Metadata == nil {
+		recommendation.Metadata = make(map[string]interface{})
+	}
+	recommendation.Metadata["reporting_pods"] = len(snapshot.Values)
+
 	klog.InfoS("Scaling recommendation computed",
 		"source", workloadKey,
 		"algorithm", algo.GetAlgorithmType(),

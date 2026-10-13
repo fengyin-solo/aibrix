@@ -228,6 +228,66 @@ type ScalingDecision struct {
 	// Error message if the scaling failed
 	// +optional
 	Error string `json:"error,omitempty"`
+
+	// Metric is the metric source that contributed most to the decision.
+	// It is populated by confidence-aware scaling decisions.
+	// +optional
+	Metric string `json:"metric,omitempty"`
+	// Confidence is the confidence of the metric that drove the decision,
+	// expressed as an integer percentage in the range [0,100].
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=100
+	Confidence int32 `json:"confidence,omitempty"`
+	// Trend is the observed metric change rate when the decision was made,
+	// expressed as an integer percentage (negative values mean the metric is
+	// decreasing).
+	// +optional
+	Trend int32 `json:"trend,omitempty"`
+	// Suppressed indicates the raw recommendation was held back because no
+	// metric source reached the confidence threshold.
+	// +optional
+	Suppressed bool `json:"suppressed,omitempty"`
+	// SuppressionReason explains why scaling was suppressed or which metric
+	// sources did not qualify.
+	// +optional
+	SuppressionReason string `json:"suppressionReason,omitempty"`
+	// MetricContributions records how every metric source participated in the
+	// decision, including its confidence, trend, vote weight and suppression
+	// reason.
+	// +optional
+	MetricContributions []MetricContribution `json:"metricContributions,omitempty"`
+}
+
+// MetricContribution explains how one metric source participated in a
+// confidence-aware scaling decision.
+type MetricContribution struct {
+	// Metric is the target metric name of this source.
+	Metric string `json:"metric"`
+	// DesiredReplicas is the replica recommendation after confidence/trend
+	// adjustment.
+	DesiredReplicas int32 `json:"desiredReplicas"`
+	// Confidence is the confidence computed for this source, expressed as an
+	// integer percentage in the range [0,100].
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=100
+	Confidence int32 `json:"confidence,omitempty"`
+	// Trend is the observed change rate of the metric, expressed as an
+	// integer percentage.
+	// +optional
+	Trend int32 `json:"trend,omitempty"`
+	// Weight is the normalized vote weight among qualified sources,
+	// expressed as an integer percentage in the range [0,100].
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=100
+	Weight int32 `json:"weight,omitempty"`
+	// Qualified reports whether this source's confidence met the threshold.
+	Qualified bool `json:"qualified"`
+	// SuppressionReason explains why this source could not drive scaling.
+	// +optional
+	SuppressionReason string `json:"suppressionReason,omitempty"`
 }
 
 // PodAutoscalerStatus defines the observed state of PodAutoscaler

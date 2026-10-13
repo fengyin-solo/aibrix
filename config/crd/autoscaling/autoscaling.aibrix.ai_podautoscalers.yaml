@@ -3,7 +3,7 @@ apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
   annotations:
-    controller-gen.kubebuilder.io/version: v0.16.1
+    controller-gen.kubebuilder.io/version: v0.17.2
   name: podautoscalers.autoscaling.aibrix.ai
 spec:
   group: autoscaling.aibrix.ai
@@ -208,8 +208,46 @@ spec:
               scalingHistory:
                 items:
                   properties:
+                    confidence:
+                      format: int32
+                      maximum: 100
+                      minimum: 0
+                      type: integer
                     error:
                       type: string
+                    metric:
+                      type: string
+                    metricContributions:
+                      items:
+                        properties:
+                          confidence:
+                            format: int32
+                            maximum: 100
+                            minimum: 0
+                            type: integer
+                          desiredReplicas:
+                            format: int32
+                            type: integer
+                          metric:
+                            type: string
+                          qualified:
+                            type: boolean
+                          suppressionReason:
+                            type: string
+                          trend:
+                            format: int32
+                            type: integer
+                          weight:
+                            format: int32
+                            maximum: 100
+                            minimum: 0
+                            type: integer
+                        required:
+                        - desiredReplicas
+                        - metric
+                        - qualified
+                        type: object
+                      type: array
                     newScale:
                       format: int32
                       type: integer
@@ -220,9 +258,16 @@ spec:
                       type: string
                     success:
                       type: boolean
+                    suppressed:
+                      type: boolean
+                    suppressionReason:
+                      type: string
                     timestamp:
                       format: date-time
                       type: string
+                    trend:
+                      format: int32
+                      type: integer
                   required:
                   - newScale
                   - previousScale

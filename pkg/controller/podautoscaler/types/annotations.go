@@ -53,4 +53,16 @@ const (
 	// ScaleToZeroLabel enables/disables scaling to zero replicas
 	// Value: bool (e.g., "true", "false")
 	ScaleToZeroLabel = AutoscalingLabelPrefix + "scale-to-zero"
+
+	// ConfidenceAwareScalingLabel enables confidence and trend aware scaling
+	// decisions. When disabled (the default), scaling behavior is unchanged.
+	// Value: bool (e.g., "true", "false")
+	ConfidenceAwareScalingLabel = AutoscalingLabelPrefix + "confidence-aware-scaling"
+
+	// ConfidenceThresholdLabel sets the minimum [0,1] confidence a metric
+	// source recommendation needs in order to drive scaling. Sources below
+	// the threshold may only converge to the current or last stable
+	// recommendation.
+	// Value: float (e.g., "0.6")
+	ConfidenceThresholdLabel = AutoscalingLabelPrefix + "confidence-threshold"
 )

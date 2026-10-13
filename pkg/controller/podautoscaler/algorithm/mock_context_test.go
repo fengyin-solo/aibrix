@@ -153,6 +153,14 @@ func (m *mockScalingContext) GetScaleToZero() bool {
 	return false
 }
 
+func (m *mockScalingContext) GetConfidenceAwareScalingEnabled() bool {
+	return false
+}
+
+func (m *mockScalingContext) GetConfidenceThreshold() float64 {
+	return 0.6
+}
+
 // UpdateByPaTypes - no-op for mock
 func (m *mockScalingContext) UpdateByPaTypes(pa *autoscalingv1alpha1.PodAutoscaler) error {
 	return nil

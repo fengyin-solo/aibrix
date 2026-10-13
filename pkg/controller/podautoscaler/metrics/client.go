@@ -17,6 +17,7 @@ package metrics
 
 import (
 	"fmt"
+	"math"
 	"sync"
 	"time"
 
@@ -258,20 +259,47 @@ func (c *MetricsClient) GetUnifiedStats(metricKey types.MetricKey, now time.Time
 // getStatsFromWindow extracts stats from a time window
 func (c *MetricsClient) getStatsFromWindow(window *types.TimeWindow) types.WindowStats {
 	var stats types.WindowStats
-	stats.DataPoints = window.Size()
+	values := window.Values()
+	stats.DataPoints = len(values)
+	stats.Values = values
 
 	if stats.DataPoints == 0 {
 		return stats
 	}
 
-	avg, _ := window.Avg()
-	minVal, _ := window.Min()
-	maxVal, _ := window.Max()
+	valuesCopy := make([]float64, len(values))
+	copy(valuesCopy, values)
 
-	stats.Mean = avg
+	var sum, minVal, maxVal, varianceSum float64
+	minVal = valuesCopy[0]
+	maxVal = valuesCopy[0]
+	for _, v := range valuesCopy {
+		sum += v
+		if v < minVal {
+			minVal = v
+		}
+		if v > maxVal {
+			maxVal = v
+		}
+	}
+	mean := sum / float64(len(valuesCopy))
+	for _, v := range valuesCopy {
+		diff := v - mean
+		varianceSum += diff * diff
+	}
+
+	stats.Mean = mean
 	stats.Min = minVal
 	stats.Max = maxVal
+	stats.Variance = varianceSum / float64(len(valuesCopy))
+	stats.StdDev = math.Sqrt(stats.Variance)
 
+	timestamps := window.Timestamps()
+	stats.Timestamps = timestamps
+	if len(timestamps) > 0 {
+		stats.WindowStart = timestamps[0]
+		stats.WindowEnd = timestamps[len(timestamps)-1]
+	}
 	stats.LastUpdate = time.Now()
 
 	return stats

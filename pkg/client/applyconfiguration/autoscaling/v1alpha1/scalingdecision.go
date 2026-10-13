@@ -24,12 +24,18 @@ import (
 // ScalingDecisionApplyConfiguration represents a declarative configuration of the ScalingDecision type for use
 // with apply.
 type ScalingDecisionApplyConfiguration struct {
-	Timestamp     *v1.Time `json:"timestamp,omitempty"`
-	PreviousScale *int32   `json:"previousScale,omitempty"`
-	NewScale      *int32   `json:"newScale,omitempty"`
-	Reason        *string  `json:"reason,omitempty"`
-	Success       *bool    `json:"success,omitempty"`
-	Error         *string  `json:"error,omitempty"`
+	Timestamp           *v1.Time                               `json:"timestamp,omitempty"`
+	PreviousScale       *int32                                 `json:"previousScale,omitempty"`
+	NewScale            *int32                                 `json:"newScale,omitempty"`
+	Reason              *string                                `json:"reason,omitempty"`
+	Success             *bool                                  `json:"success,omitempty"`
+	Error               *string                                `json:"error,omitempty"`
+	Metric              *string                                `json:"metric,omitempty"`
+	Confidence          *int32                                 `json:"confidence,omitempty"`
+	Trend               *int32                                 `json:"trend,omitempty"`
+	Suppressed          *bool                                  `json:"suppressed,omitempty"`
+	SuppressionReason   *string                                `json:"suppressionReason,omitempty"`
+	MetricContributions []MetricContributionApplyConfiguration `json:"metricContributions,omitempty"`
 }
 
 // ScalingDecisionApplyConfiguration constructs a declarative configuration of the ScalingDecision type for use with
@@ -83,5 +89,58 @@ func (b *ScalingDecisionApplyConfiguration) WithSuccess(value bool) *ScalingDeci
 // If called multiple times, the Error field is set to the value of the last call.
 func (b *ScalingDecisionApplyConfiguration) WithError(value string) *ScalingDecisionApplyConfiguration {
 	b.Error = &value
+	return b
+}
+
+// WithMetric sets the Metric field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the Metric field is set to the value of the last call.
+func (b *ScalingDecisionApplyConfiguration) WithMetric(value string) *ScalingDecisionApplyConfiguration {
+	b.Metric = &value
+	return b
+}
+
+// WithConfidence sets the Confidence field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the Confidence field is set to the value of the last call.
+func (b *ScalingDecisionApplyConfiguration) WithConfidence(value int32) *ScalingDecisionApplyConfiguration {
+	b.Confidence = &value
+	return b
+}
+
+// WithTrend sets the Trend field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the Trend field is set to the value of the last call.
+func (b *ScalingDecisionApplyConfiguration) WithTrend(value int32) *ScalingDecisionApplyConfiguration {
+	b.Trend = &value
+	return b
+}
+
+// WithSuppressed sets the Suppressed field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the Suppressed field is set to the value of the last call.
+func (b *ScalingDecisionApplyConfiguration) WithSuppressed(value bool) *ScalingDecisionApplyConfiguration {
+	b.Suppressed = &value
+	return b
+}
+
+// WithSuppressionReason sets the SuppressionReason field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the SuppressionReason field is set to the value of the last call.
+func (b *ScalingDecisionApplyConfiguration) WithSuppressionReason(value string) *ScalingDecisionApplyConfiguration {
+	b.SuppressionReason = &value
+	return b
+}
+
+// WithMetricContributions adds the given value to the MetricContributions field in the declarative configuration
+// and returns the receiver, so that objects can be build by chaining "With" function invocations.
+// If called multiple times, values provided by each call will be appended to the MetricContributions field.
+func (b *ScalingDecisionApplyConfiguration) WithMetricContributions(values ...*MetricContributionApplyConfiguration) *ScalingDecisionApplyConfiguration {
+	for i := range values {
+		if values[i] == nil {
+			panic("nil value passed to WithMetricContributions")
+		}
+		b.MetricContributions = append(b.MetricContributions, *values[i])
+	}
 	return b
 }

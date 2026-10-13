@@ -236,18 +236,30 @@ var _ = ginkgo.Describe("ModelClaim controller test", func() {
 		}, modelClaimTimeout, modelClaimInterval).Should(gomega.Succeed())
 		fixture.ExpectEvent(claim, corev1.EventTypeNormal, "Sleeping")
 
+		failedPort := fixture.GetClaim(gomega.Default, claim).Status.Instances[0].Port
+		activationsBeforeFailure := fixture.Runtime().ActivateCallCount()
 		fixture.Runtime().SetClaimState(string(claim.UID), "failed", false, "restart budget exhausted")
 		fixture.TriggerReconcile(claim)
+		// The terminal failure is emitted as an event (the transient Failed
+		// status itself is asserted deterministically in unit tests).
+		fixture.ExpectEvent(claim, corev1.EventTypeWarning, "EngineFailed")
+		// With no other warm pod available, the controller releases the failed
+		// engine and replays the replica on the same pod instead of parking the
+		// claim in Failed.
 		gomega.Eventually(func(g gomega.Gomega) {
 			latest := fixture.GetClaim(g, claim)
-			g.Expect(latest.Status.Phase).To(gomega.Equal(modelapi.ModelClaimFailed))
-			g.Expect(latest.Status.Instances[0].Phase).To(gomega.Equal(modelapi.ModelClaimFailed))
-			ready := meta.FindStatusCondition(latest.Status.Conditions, string(modelapi.ModelClaimConditionReady))
-			g.Expect(ready).NotTo(gomega.BeNil())
-			g.Expect(ready.Reason).To(gomega.Equal("EngineFailed"))
-			fixture.ExpectRoute(g, ns.Name, pod.Name, claim.Name, 0, constants.ModelClaimRoutingStateFailed)
+			g.Expect(latest.Status.Phase).To(gomega.Equal(modelapi.ModelClaimActive))
+			g.Expect(latest.Status.ReadyReplicas).To(gomega.Equal(int32(1)))
+			g.Expect(latest.Status.Instances).To(gomega.HaveLen(1))
+			g.Expect(latest.Status.Instances[0].Pod).To(gomega.Equal(pod.Name))
+			g.Expect(latest.Status.Instances[0].Ready).To(gomega.BeTrue())
+			g.Expect(latest.Status.Instances[0].Port).NotTo(gomega.BeNumerically("==", failedPort))
+			fixture.ExpectRoute(g, ns.Name, pod.Name, claim.Name, latest.Status.Instances[0].Port, constants.ModelClaimRoutingStateActive)
 		}, modelClaimTimeout, modelClaimInterval).Should(gomega.Succeed())
-		fixture.ExpectEvent(claim, corev1.EventTypeWarning, "EngineFailed")
+		gomega.Expect(fixture.Runtime().ActivateCallCount()).To(gomega.BeNumerically(">", activationsBeforeFailure))
+		gomega.Expect(fixture.Runtime().DeactivateRequests()).To(gomega.ContainElement(
+			modelclaimcontroller.DeactivateRequest{ModelName: claim.Name, Mode: modelclaimcontroller.DeactivateStop},
+		))
 	})
 
 	ginkgo.It("drops a lost assignment and activates on a replacement pod", func() {
@@ -355,6 +367,146 @@ var _ = ginkgo.Describe("ModelClaim controller test", func() {
 				latestPod.Annotations[constants.ModelClaimPodAnnotationPrefix+claim.Name],
 			).To(gomega.Equal(originalAnnotation))
 		}, 2*time.Second, modelClaimInterval).Should(gomega.Succeed())
+	})
+
+	ginkgo.It("places multiple replicas on distinct warm pods", func() {
+		// CRD validation must accept replicas > 1.
+		fixture.Runtime().SetDefaultState("active", true)
+		podA := fixture.CreateWarmPod(ns.Name, "warm-a", "pool-a")
+		podB := fixture.CreateWarmPod(ns.Name, "warm-b", "pool-a")
+		podC := fixture.CreateWarmPod(ns.Name, "warm-c", "pool-a")
+		claim := fixture.CreateClaim(ns.Name, "claim-multi", "pool-a", nil, nil, 3)
+
+		gomega.Eventually(func(g gomega.Gomega) {
+			latest := fixture.GetClaim(g, claim)
+			g.Expect(latest.Status.Phase).To(gomega.Equal(modelapi.ModelClaimActive))
+			g.Expect(latest.Status.DesiredReplicas).To(gomega.Equal(int32(3)))
+			g.Expect(latest.Status.ReadyReplicas).To(gomega.Equal(int32(3)))
+			g.Expect(latest.Status.Instances).To(gomega.HaveLen(3))
+			pods := make([]string, 0, 3)
+			for _, in := range latest.Status.Instances {
+				g.Expect(in.Ready).To(gomega.BeTrue())
+				g.Expect(in.Phase).To(gomega.Equal(modelapi.ModelClaimActive))
+				pods = append(pods, in.Pod)
+			}
+			g.Expect(pods).To(gomega.ConsistOf(podA.Name, podB.Name, podC.Name))
+		}, modelClaimTimeout, modelClaimInterval).Should(gomega.Succeed())
+
+		latest := fixture.GetClaim(gomega.Default, claim)
+		for _, in := range latest.Status.Instances {
+			fixture.ExpectRoute(gomega.Default, ns.Name, in.Pod, claim.Name, in.Port, constants.ModelClaimRoutingStateActive)
+		}
+		gomega.Expect(fixture.Runtime().ActivatePods()).To(gomega.ConsistOf(podA.Name, podB.Name, podC.Name))
+	})
+
+	ginkgo.It("scales out replicas as warm pods appear", func() {
+		fixture.Runtime().SetDefaultState("active", true)
+		first := fixture.CreateWarmPod(ns.Name, "warm-scale", "pool-a")
+		claim := fixture.CreateClaim(ns.Name, "claim-scale", "pool-a", nil, nil, 3)
+
+		gomega.Eventually(func(g gomega.Gomega) {
+			latest := fixture.GetClaim(g, claim)
+			g.Expect(latest.Status.ReadyReplicas).To(gomega.Equal(int32(1)))
+			g.Expect(latest.Status.Instances).To(gomega.HaveLen(1))
+			g.Expect(latest.Status.Instances[0].Pod).To(gomega.Equal(first.Name))
+		}, modelClaimTimeout, modelClaimInterval).Should(gomega.Succeed())
+
+		second := fixture.CreateWarmPod(ns.Name, "warm-scale-2", "pool-a")
+		third := fixture.CreateWarmPod(ns.Name, "warm-scale-3", "pool-a")
+		gomega.Eventually(func(g gomega.Gomega) {
+			latest := fixture.GetClaim(g, claim)
+			g.Expect(latest.Status.ReadyReplicas).To(gomega.Equal(int32(3)))
+			pods := make([]string, 0, 3)
+			for _, in := range latest.Status.Instances {
+				pods = append(pods, in.Pod)
+			}
+			g.Expect(pods).To(gomega.ConsistOf(first.Name, second.Name, third.Name))
+		}, modelClaimTimeout, modelClaimInterval).Should(gomega.Succeed())
+	})
+
+	ginkgo.It("scales down replicas without taking the last healthy engine first", func() {
+		fixture.Runtime().SetDefaultState("active", true)
+		fixture.CreateWarmPod(ns.Name, "warm-d1", "pool-a")
+		fixture.CreateWarmPod(ns.Name, "warm-d2", "pool-a")
+		fixture.CreateWarmPod(ns.Name, "warm-d3", "pool-a")
+		claim := fixture.CreateClaim(ns.Name, "claim-down", "pool-a", nil, nil, 3)
+
+		gomega.Eventually(func(g gomega.Gomega) {
+			g.Expect(fixture.GetClaim(g, claim).Status.ReadyReplicas).To(gomega.Equal(int32(3)))
+		}, modelClaimTimeout, modelClaimInterval).Should(gomega.Succeed())
+
+		desired := int32(1)
+		gomega.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(claim), claim)).To(gomega.Succeed())
+		claim.Spec.Replicas = &desired
+		gomega.Expect(k8sClient.Update(ctx, claim)).To(gomega.Succeed())
+
+		gomega.Eventually(func(g gomega.Gomega) {
+			latest := fixture.GetClaim(g, claim)
+			g.Expect(latest.Status.ReadyReplicas).To(gomega.Equal(int32(1)))
+			g.Expect(latest.Status.Instances).To(gomega.HaveLen(1))
+			g.Expect(latest.Status.Instances[0].Phase).To(gomega.Equal(modelapi.ModelClaimActive))
+			g.Expect(latest.Status.Instances[0].Pod).To(gomega.Equal("warm-d1"),
+				"deterministic victim order keeps the earliest-named pod")
+		}, modelClaimTimeout, modelClaimInterval).Should(gomega.Succeed())
+	})
+
+	ginkgo.It("replays a failed engine onto another pod and keeps the route ready after replacement", func() {
+		fixture.Runtime().SetDefaultState("active", true)
+		old := fixture.CreateWarmPod(ns.Name, "warm-f1", "pool-a")
+		fixture.CreateWarmPod(ns.Name, "warm-f2", "pool-a")
+		claim := fixture.CreateClaim(ns.Name, "claim-failover", "pool-a", nil, nil, 1)
+
+		gomega.Eventually(func(g gomega.Gomega) {
+			latest := fixture.GetClaim(g, claim)
+			g.Expect(latest.Status.Phase).To(gomega.Equal(modelapi.ModelClaimActive))
+			g.Expect(latest.Status.Instances).To(gomega.HaveLen(1))
+			g.Expect(latest.Status.Instances[0].Pod).To(gomega.Equal(old.Name))
+		}, modelClaimTimeout, modelClaimInterval).Should(gomega.Succeed())
+
+		// Terminal failure on the first pod: replacement must land on the other
+		// pod, and the failed annotation must be removed only after replay.
+		fixture.Runtime().SetPodClaimState(old.Name, string(claim.UID), "failed", false, "restart budget exhausted")
+		fixture.TriggerReconcile(claim)
+
+		gomega.Eventually(func(g gomega.Gomega) {
+			latest := fixture.GetClaim(g, claim)
+			g.Expect(latest.Status.Phase).To(gomega.Equal(modelapi.ModelClaimActive))
+			g.Expect(latest.Status.ReadyReplicas).To(gomega.Equal(int32(1)))
+			g.Expect(latest.Status.Instances).To(gomega.HaveLen(1))
+			g.Expect(latest.Status.Instances[0].Pod).To(gomega.Equal("warm-f2"))
+			g.Expect(latest.Status.Instances[0].Ready).To(gomega.BeTrue())
+		}, modelClaimTimeout, modelClaimInterval).Should(gomega.Succeed())
+
+		oldPod := &corev1.Pod{}
+		gomega.Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns.Name, Name: old.Name}, oldPod)).To(gomega.Succeed())
+		gomega.Expect(oldPod.Annotations).NotTo(gomega.HaveKey(constants.ModelClaimPodAnnotationPrefix + claim.Name))
+		gomega.Expect(fixture.Runtime().DeactivateRequests()).To(gomega.ContainElement(
+			modelclaimcontroller.DeactivateRequest{ModelName: claim.Name, Mode: modelclaimcontroller.DeactivateStop},
+		))
+	})
+
+	ginkgo.It("stops every replica before releasing the finalizer on delete", func() {
+		fixture.Runtime().SetDefaultState("active", true)
+		podA := fixture.CreateWarmPod(ns.Name, "warm-del-1", "pool-a")
+		podB := fixture.CreateWarmPod(ns.Name, "warm-del-2", "pool-a")
+		claim := fixture.CreateClaim(ns.Name, "claim-del-multi", "pool-a", nil, nil, 2)
+
+		gomega.Eventually(func(g gomega.Gomega) {
+			g.Expect(fixture.GetClaim(g, claim).Status.ReadyReplicas).To(gomega.Equal(int32(2)))
+		}, modelClaimTimeout, modelClaimInterval).Should(gomega.Succeed())
+
+		gomega.Expect(k8sClient.Delete(ctx, claim)).To(gomega.Succeed())
+		gomega.Eventually(func(g gomega.Gomega) {
+			err := k8sClient.Get(ctx, client.ObjectKeyFromObject(claim), &modelapi.ModelClaim{})
+			g.Expect(apierrors.IsNotFound(err)).To(gomega.BeTrue())
+		}, modelClaimTimeout, modelClaimInterval).Should(gomega.Succeed())
+
+		gomega.Expect(fixture.Runtime().DeactivateRequests()).To(gomega.HaveLen(2))
+		for _, pod := range []*corev1.Pod{podA, podB} {
+			latest := &corev1.Pod{}
+			gomega.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(pod), latest)).To(gomega.Succeed())
+			gomega.Expect(latest.Annotations).NotTo(gomega.HaveKey(constants.ModelClaimPodAnnotationPrefix + claim.Name))
+		}
 	})
 
 	ginkgo.It("keeps multiple ModelClaims assignments and status isolated", func() {

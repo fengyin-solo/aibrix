@@ -51,29 +51,38 @@ const (
 
 // fakeRuntime is an in-process RuntimeClient that records calls and hands out
 // monotonic ports, so the reconcile loop can be tested without a real runtime.
+// Engines are tracked per pod IP so multi-replica and replay scenarios can
+// observe a different runtime state on every warm pod.
 type fakeRuntime struct {
-	activateCalls   []ActivateRequest
-	deactivateCalls []DeactivateRequest
-	kvLimitCalls    []SetKVLimitRequest
-	sleepCalls      []SleepRequest
-	listCalls       int
-	snapshotCalls   int
-	portSeq         int32
-	failActivate    bool
+	activateCalls    []ActivateRequest
+	activatePodIPs   []string
+	deactivateCalls  []DeactivateRequest
+	deactivatePodIPs []string
+	kvLimitCalls     []SetKVLimitRequest
+	sleepCalls       []SleepRequest
+	listCalls        int
+	snapshotCalls    int
+	portSeq          int32
+	failActivate     bool
+	// failDeactivate makes every Deactivate call fail, used to exercise the
+	// deletion finalizer's wait-for-stop path.
+	failDeactivate bool
 	// notReady makes runtime snapshots report activated engines as not yet
 	// serveable, so a test can hold a model in the Activating phase.
 	notReady bool
-	// models tracks the engines the fake currently hosts, keyed by served
-	// model name, so Snapshot can drive the controller's readiness gate.
-	models map[string]ModelInfo
+	// models tracks the engines the fake currently hosts on each pod IP,
+	// keyed by served model name, so Snapshot can drive the controller's
+	// readiness gate independently per warm pod.
+	models map[string]map[string]ModelInfo
 	// snapshots reports per-pod runtime state for Phase-2 placement tests.
 	snapshots map[string]*RuntimeSnapshot
 	// nilSnapshots lets defensive-path tests model an invalid client response.
 	nilSnapshots map[string]bool
 }
 
-func (f *fakeRuntime) Activate(_ context.Context, _ string, _ int, req *ActivateRequest) (*ActivateResponse, error) {
+func (f *fakeRuntime) Activate(_ context.Context, podIP string, _ int, req *ActivateRequest) (*ActivateResponse, error) {
 	f.activateCalls = append(f.activateCalls, *req)
+	f.activatePodIPs = append(f.activatePodIPs, podIP)
 	if f.failActivate {
 		return &ActivateResponse{Status: "error", Message: "boom"}, fmt.Errorf("activate failed: boom")
 	}
@@ -83,9 +92,12 @@ func (f *fakeRuntime) Activate(_ context.Context, _ string, _ int, req *Activate
 		port = 9000 + f.portSeq
 	}
 	if f.models == nil {
-		f.models = map[string]ModelInfo{}
+		f.models = map[string]map[string]ModelInfo{}
 	}
-	f.models[req.ModelName] = ModelInfo{
+	if f.models[podIP] == nil {
+		f.models[podIP] = map[string]ModelInfo{}
+	}
+	f.models[podIP][req.ModelName] = ModelInfo{
 		ModelName: req.ModelName,
 		Port:      port,
 		IPCName:   req.IPCName,
@@ -95,10 +107,26 @@ func (f *fakeRuntime) Activate(_ context.Context, _ string, _ int, req *Activate
 	return &ActivateResponse{Status: "success", ModelName: req.ModelName, Port: port, IPCName: req.IPCName}, nil
 }
 
-func (f *fakeRuntime) Deactivate(_ context.Context, _ string, _ int, req *DeactivateRequest) error {
+func (f *fakeRuntime) Deactivate(_ context.Context, podIP string, _ int, req *DeactivateRequest) error {
 	f.deactivateCalls = append(f.deactivateCalls, *req)
-	delete(f.models, req.ModelName)
+	f.deactivatePodIPs = append(f.deactivatePodIPs, podIP)
+	if f.failDeactivate {
+		return fmt.Errorf("deactivate failed: boom")
+	}
+	delete(f.models[podIP], req.ModelName)
 	return nil
+}
+
+// putModel seeds an engine state on a pod IP, mirroring what a real runtime
+// snapshot would report.
+func (f *fakeRuntime) putModel(podIP string, m ModelInfo) {
+	if f.models == nil {
+		f.models = map[string]map[string]ModelInfo{}
+	}
+	if f.models[podIP] == nil {
+		f.models[podIP] = map[string]ModelInfo{}
+	}
+	f.models[podIP][m.ModelName] = m
 }
 
 func (f *fakeRuntime) SetKVLimit(_ context.Context, _ string, _ int, req *SetKVLimitRequest) (*RuntimeOperationResponse, error) {
@@ -121,10 +149,10 @@ func (f *fakeRuntime) Wake(_ context.Context, _ string, _ int, req *WakeRequest)
 	}, nil
 }
 
-func (f *fakeRuntime) ListModels(_ context.Context, _ string, _ int) ([]ModelInfo, error) {
+func (f *fakeRuntime) ListModels(_ context.Context, podIP string, _ int) ([]ModelInfo, error) {
 	f.listCalls++
-	out := make([]ModelInfo, 0, len(f.models))
-	for _, m := range f.models {
+	out := make([]ModelInfo, 0, len(f.models[podIP]))
+	for _, m := range f.models[podIP] {
 		if m.Phase != "sleeping" {
 			m.Ready = !f.notReady // readiness evaluated at call time so tests can flip it
 		}
@@ -144,7 +172,7 @@ func (f *fakeRuntime) Snapshot(_ context.Context, podIP string, _ int) (*Runtime
 		copy.Models = append([]RuntimeSnapshotModel(nil), snapshot.Models...)
 		result = &copy
 	}
-	for _, model := range f.models {
+	for _, model := range f.models[podIP] {
 		present := false
 		for i := range result.Models {
 			if result.Models[i].ModelName == model.ModelName {
@@ -763,11 +791,9 @@ func TestReconcileSnapshotCorrectsRouteToActualRuntimePort(t *testing.T) {
 		constants.ModelClaimPodAnnotationPrefix + pm.Name: `{"model":"qwen2-7b","port":9001}`,
 	}
 	r, runtime := newReconciler(t, pm, pod)
-	runtime.models = map[string]ModelInfo{
-		servedModelName(pm): {
-			ModelName: servedModelName(pm), Port: 9001, Phase: "active", Ready: true,
-		},
-	}
+	runtime.putModel("10.0.0.1", ModelInfo{
+		ModelName: servedModelName(pm), Port: 9001, Phase: "active", Ready: true,
+	})
 	runtime.snapshots = map[string]*RuntimeSnapshot{
 		"10.0.0.1": {Models: []RuntimeSnapshotModel{{
 			ModelName: servedModelName(pm), Port: 9100, Phase: "active", Alive: true, Ready: true,
@@ -826,11 +852,9 @@ func TestReconcileSnapshotTerminalFailureDeroutesAndFailsClaim(t *testing.T) {
 		constants.ModelClaimPodAnnotationPrefix + pm.Name: `{"model":"qwen2-7b","port":9001}`,
 	}
 	r, runtime := newReconciler(t, pm, pod)
-	runtime.models = map[string]ModelInfo{
-		servedModelName(pm): {
-			ModelName: servedModelName(pm), Port: 9001, Phase: "active", Ready: true,
-		},
-	}
+	runtime.putModel("10.0.0.1", ModelInfo{
+		ModelName: servedModelName(pm), Port: 9001, Phase: "active", Ready: true,
+	})
 	runtime.snapshots = map[string]*RuntimeSnapshot{
 		"10.0.0.1": {Models: []RuntimeSnapshotModel{{
 			ModelName: servedModelName(pm),
@@ -898,12 +922,12 @@ func TestReconcileSleepingInstanceRemovesRouteAndWakeRestoresIt(t *testing.T) {
 	active := getModel(t, r, pm.Name)
 	require.Len(t, active.Status.Instances, 1)
 	port := active.Status.Instances[0].Port
-	runtime.models[servedModelName(pm)] = ModelInfo{
+	runtime.putModel("10.0.0.1", ModelInfo{
 		ModelName: servedModelName(pm),
 		Port:      port,
 		Phase:     "sleeping",
 		Ready:     false,
-	}
+	})
 
 	reconcileOnce(t, r, pm.Name)
 
@@ -922,12 +946,12 @@ func TestReconcileSleepingInstanceRemovesRouteAndWakeRestoresIt(t *testing.T) {
 		"sleeping engine must be non-routable")
 	assert.Len(t, runtime.activateCalls, 1, "sleep must keep its assigned instance")
 
-	runtime.models[servedModelName(pm)] = ModelInfo{
+	runtime.putModel("10.0.0.1", ModelInfo{
 		ModelName: servedModelName(pm),
 		Port:      port,
 		Phase:     "active",
 		Ready:     false,
-	}
+	})
 	runtime.notReady = true
 	reconcileOnce(t, r, pm.Name)
 
@@ -977,9 +1001,7 @@ func TestReconcileIdempotent(t *testing.T) {
 		warmPod("warm-1", "b300-pool-a", true, corev1.PodRunning),
 		warmPod("warm-2", "b300-pool-a", true, corev1.PodRunning),
 	)
-	runtime.models = map[string]ModelInfo{
-		servedModelName(pm): {ModelName: servedModelName(pm), Port: 9001, Phase: "active", Ready: true},
-	}
+	runtime.putModel("10.0.0.1", ModelInfo{ModelName: servedModelName(pm), Port: 9001, Phase: "active", Ready: true})
 
 	reconcileOnce(t, r, pm.Name)
 

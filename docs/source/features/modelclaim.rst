@@ -6,23 +6,32 @@ ModelClaim High-Density GPU Runtime Pools
 
 .. warning::
 
-   ModelClaim is an experimental feature. It currently supports one engine
-   replica per claim, uses a fixed GPU topology per warm pool, and requires a
-   dedicated kvcached runtime image. Validate the feature with your engine,
-   model, GPU, and workload before using it for production traffic.
+   ModelClaim is an experimental feature. It uses a fixed GPU topology per
+   warm pool and requires a dedicated kvcached runtime image. Validate the
+   feature with your engine, model, GPU, and workload before using it for
+   production traffic.
 
 ModelClaim lets several independently managed model engines share a warm GPU
 runtime Pod. Instead of creating one Kubernetes Deployment per model, an
 operator first creates a pool of topology-homogeneous GPU Pods. A user then
 creates a ``ModelClaim`` for each model that should run in the pool.
 
-The ModelClaim controller selects a compatible Pod, asks the AIBrix runtime
-agent to start a separate engine process, and publishes the engine's port to the
-AIBrix gateway only after the engine is ready. The default experimental image
-contains vLLM; SGLang requires a custom compatible runtime image. The kvcached
-framework provides elastic KV-cache memory across colocated engines. An
-optional pool policy can redistribute KV capacity according to observed
-requests and put idle vLLM engines into sleep mode.
+A claim may declare ``replicas`` engine instances. Each replica is a separate
+engine process placed on a distinct warm Pod: the controller schedules
+replicas from runtime snapshots (cached artifact, free GPU HBM, KV usage,
+current engine count), rolls scale changes safely (new engines are activated
+and confirmed ready before surplus engines stop, and the last healthy engine
+is never stopped first), and automatically replays an instance when its Pod
+disappears or its engine terminally fails. The gateway only routes traffic to
+ready replicas and load-balances across them.
+
+The ModelClaim controller selects compatible Pods, asks the AIBrix runtime
+agent to start a separate engine process per replica, and publishes each
+engine's port to the AIBrix gateway only after the engine is ready. The
+default experimental image contains vLLM; SGLang requires a custom compatible
+runtime image. The kvcached framework provides elastic KV-cache memory across
+colocated engines. An optional pool policy can redistribute KV capacity
+according to observed requests and put idle vLLM engines into sleep mode.
 
 Architecture
 ------------
@@ -241,7 +250,8 @@ The supported spec fields are:
        compatible custom runtime image.
    * - ``replicas``
      - No
-     - Defaults to 1. The current API only accepts 1.
+     - Defaults to 1. Number of engine instances; every replica is placed on a
+       different warm Pod and served independently. Must be at least 1.
    * - ``engineConfig.args``
      - No
      - Engine CLI flags mapped to string values. Use an empty string for a
@@ -342,6 +352,41 @@ For detailed engine and memory state, port-forward the runtime API:
 The snapshot includes per-engine port, IPC name, phase, liveness, readiness,
 restart count, last error, KV usage and capacity, best-effort HBM peak, request
 activity, and cached-artifact markers.
+
+Multiple replicas, scaling, and failure replay
+------------------------------------------------
+
+With ``replicas: N`` the controller keeps one engine per distinct warm Pod and
+writes one entry per instance to ``status.instances``: ``pod``, ``port``,
+``phase``, ``ready``, and ``restartCount``. ``status.readyReplicas`` counts
+only the instances whose engine is active and routable.
+
+Placement is deterministic from the live runtime snapshot, in this order:
+Pods that already cache the requested artifact come first; among the rest,
+preference goes to known snapshots, more free GPU HBM, less KV in use, fewer
+resident engines, fewer cross-claim placements, and finally the Pod name.
+When the pool has observed the same artifact running elsewhere, its measured
+HBM peak (or configured KV capacity) is used as a hard free-HBM floor: a Pod
+without that much free HBM is not selected. With fewer eligible Pods than
+replicas, the claim waits (``Pending``) and fills new slots as Pods appear.
+
+Scaling and replay follow a safe order:
+
+* a replacement (scale-up slot, disappeared Pod, or terminally failed engine)
+  is activated on a new Pod and kept non-routable until it reports ready;
+* only after the replacement is ready is the old/surplus engine stopped;
+* on scale-down, failed, sleeping, and booting instances are stopped before
+  healthy ones, and a healthy engine is never stopped while it would leave
+  fewer than ``replicas`` ready instances;
+* if a Pod disappears, its instance is dropped and re-placed automatically;
+  if an engine terminally fails, the controller replays it onto a different
+  eligible Pod, or retries on the same Pod when no other exists;
+* while a ``DeletionTimestamp`` is set, every instance is stopped and
+  confirmed gone from its Pod's snapshot before the finalizer is released.
+
+The gateway load-balances across ready replicas; activating, sleeping, and
+failed instances never enter the backend set, and when no replica is ready a
+sleeping one is woken on demand.
 
 Send inference requests
 -----------------------

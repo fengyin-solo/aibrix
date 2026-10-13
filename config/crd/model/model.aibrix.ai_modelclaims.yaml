@@ -93,7 +93,6 @@ spec:
               replicas:
                 default: 1
                 format: int32
-                maximum: 1
                 minimum: 1
                 type: integer
             required:
@@ -152,6 +151,11 @@ spec:
                     pod:
                       type: string
                     port:
+                      format: int32
+                      type: integer
+                    ready:
+                      type: boolean
+                    restartCount:
                       format: int32
                       type: integer
                   required:

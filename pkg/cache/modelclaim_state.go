@@ -20,6 +20,7 @@ import (
 	"sort"
 	"sync"
 
+	"github.com/vllm-project/aibrix/pkg/constants"
 	v1 "k8s.io/api/core/v1"
 )
 
@@ -73,18 +74,53 @@ func (s *modelClaimState) get(model string) []modelClaimBinding {
 	return out
 }
 
-// ModelClaimBinding returns one deterministic advertisement for a served
-// model. ModelClaim currently enforces one replica, while deterministic
-// ordering keeps this safe if duplicate served names temporarily coexist.
-func (c *Store) ModelClaimBinding(modelName string) (*v1.Pod, int, string, bool) {
-	for _, binding := range c.modelClaims.get(modelName) {
-		metaPod, found := c.metaPods.Load(binding.podKey)
-		if !found || metaPod == nil || metaPod.Pod == nil {
-			continue
-		}
-		return metaPod.Pod, binding.port, binding.state, true
+// modelClaimWakeStateRank orders the non-routable binding the gateway falls
+// back to when a model has no Ready replica: a sleeping engine can be woken,
+// so it wins over a still-booting one, then a failed one, then any stray
+// active binding. Within one state the lowest podKey wins deterministically.
+func modelClaimWakeStateRank(state string) int {
+	switch state {
+	case constants.ModelClaimRoutingStateSleeping:
+		return 0
+	case constants.ModelClaimRoutingStateActivating:
+		return 1
+	case constants.ModelClaimRoutingStateFailed:
+		return 2
+	case constants.ModelClaimRoutingStateActive:
+		return 3
+	default:
+		return 4
 	}
-	return nil, 0, "", false
+}
+
+// ModelClaimBinding returns one deterministic non-routable advertisement for a
+// served model. It is consulted only when no Active replica registers the
+// model in the normal routing set; the preferred binding is a sleeping engine
+// (so the gateway can trigger a wake), then activating, then failed. With
+// multiple replicas sharing one served name the result is deterministic within
+// a state (lowest pod key).
+func (c *Store) ModelClaimBinding(modelName string) (*v1.Pod, int, string, bool) {
+	bestState := 5
+	var best modelClaimBinding
+	found := false
+	// get() returns bindings sorted by pod key ascending, so the first
+	// occurrence of the best-ranked state is also the deterministic lowest-key
+	// choice within that state.
+	for _, binding := range c.modelClaims.get(modelName) {
+		if rank := modelClaimWakeStateRank(binding.state); rank < bestState {
+			bestState = rank
+			best = binding
+			found = true
+		}
+	}
+	if !found {
+		return nil, 0, "", false
+	}
+	metaPod, ok := c.metaPods.Load(best.podKey)
+	if !ok || metaPod == nil || metaPod.Pod == nil {
+		return nil, 0, "", false
+	}
+	return metaPod.Pod, best.port, best.state, true
 }
 
 var _ ModelClaimBindingProvider = (*Store)(nil)

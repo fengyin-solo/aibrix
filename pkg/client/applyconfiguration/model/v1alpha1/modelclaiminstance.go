@@ -24,9 +24,11 @@ import (
 // ModelClaimInstanceApplyConfiguration represents a declarative configuration of the ModelClaimInstance type for use
 // with apply.
 type ModelClaimInstanceApplyConfiguration struct {
-	Pod   *string                   `json:"pod,omitempty"`
-	Port  *int32                    `json:"port,omitempty"`
-	Phase *v1alpha1.ModelClaimPhase `json:"phase,omitempty"`
+	Pod          *string                   `json:"pod,omitempty"`
+	Port         *int32                    `json:"port,omitempty"`
+	Phase        *v1alpha1.ModelClaimPhase `json:"phase,omitempty"`
+	Ready        *bool                     `json:"ready,omitempty"`
+	RestartCount *int32                    `json:"restartCount,omitempty"`
 }
 
 // ModelClaimInstanceApplyConfiguration constructs a declarative configuration of the ModelClaimInstance type for use with
@@ -56,5 +58,21 @@ func (b *ModelClaimInstanceApplyConfiguration) WithPort(value int32) *ModelClaim
 // If called multiple times, the Phase field is set to the value of the last call.
 func (b *ModelClaimInstanceApplyConfiguration) WithPhase(value v1alpha1.ModelClaimPhase) *ModelClaimInstanceApplyConfiguration {
 	b.Phase = &value
+	return b
+}
+
+// WithReady sets the Ready field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the Ready field is set to the value of the last call.
+func (b *ModelClaimInstanceApplyConfiguration) WithReady(value bool) *ModelClaimInstanceApplyConfiguration {
+	b.Ready = &value
+	return b
+}
+
+// WithRestartCount sets the RestartCount field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the RestartCount field is set to the value of the last call.
+func (b *ModelClaimInstanceApplyConfiguration) WithRestartCount(value int32) *ModelClaimInstanceApplyConfiguration {
+	b.RestartCount = &value
 	return b
 }

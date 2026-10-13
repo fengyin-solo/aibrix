@@ -164,6 +164,99 @@ func TestModelClaimRoutabilityViaAnnotationUpdate(t *testing.T) {
 	assert.True(t, c.HasModel("m"))
 }
 
+// Multi-replica routing: only Active (state=active, port>0) bindings register
+// the model as a routable backend; Activating/Sleeping replicas stay out of
+// ListPodsByModel even while siblings serve traffic.
+func TestModelClaimMultiReplicaOnlyActiveBindingsAreRoutable(t *testing.T) {
+	c := NewForTest()
+	anno := func(port int, state string) string {
+		return fmt.Sprintf(`{"model":"m-multi","port":%d,"state":"%s"}`, port, state)
+	}
+	mk := func(name, ip string, port int, state string) *v1.Pod {
+		return &v1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      name,
+				Namespace: "default",
+				Labels:    map[string]string{constants.ModelPoolLabelName: "pool-a", constants.ModelPoolLabelEnabled: "true"},
+				Annotations: map[string]string{
+					constants.ModelClaimPodAnnotationPrefix + name: anno(port, state),
+				},
+			},
+			Status: v1.PodStatus{
+				PodIP:      ip,
+				Conditions: []v1.PodCondition{{Type: v1.PodReady, Status: v1.ConditionTrue}},
+			},
+		}
+	}
+	activeA := mk("pa", "10.0.0.1", 9001, constants.ModelClaimRoutingStateActive)
+	activeB := mk("pb", "10.0.0.2", 9002, constants.ModelClaimRoutingStateActive)
+	booting := mk("pc", "10.0.0.3", 0, constants.ModelClaimRoutingStateActivating)
+	sleeping := mk("pd", "10.0.0.4", 0, constants.ModelClaimRoutingStateSleeping)
+	for _, p := range []*v1.Pod{activeA, activeB, booting, sleeping} {
+		c.addPod(p)
+	}
+
+	assert.True(t, c.HasModel("m-multi"))
+	pods, err := c.ListPodsByModel("m-multi")
+	require.NoError(t, err)
+	got := pods.All()
+	require.Len(t, got, 2)
+	names := []string{got[0].Name, got[1].Name}
+	assert.ElementsMatch(t, []string{"pa", "pb"}, names)
+}
+
+// With no Active replica, the fallback binding prefers a sleeping engine (the
+// gateway can wake it) over an activating or failed one.
+func TestModelClaimBindingWakePreference(t *testing.T) {
+	c := NewForTest()
+	mk := func(name, state string) *v1.Pod {
+		return &v1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      name,
+				Namespace: "default",
+				Labels:    map[string]string{constants.ModelPoolLabelName: "pool-a", constants.ModelPoolLabelEnabled: "true"},
+				Annotations: map[string]string{
+					constants.ModelClaimPodAnnotationPrefix + name: fmt.Sprintf(`{"model":"m-mix","port":0,"state":"%s"}`, state),
+				},
+			},
+			Status: v1.PodStatus{PodIP: "10.0.0.9"},
+		}
+	}
+	for _, p := range []*v1.Pod{
+		mk("p-failed", constants.ModelClaimRoutingStateFailed),
+		mk("p-sleep", constants.ModelClaimRoutingStateSleeping),
+		mk("p-boot", constants.ModelClaimRoutingStateActivating),
+	} {
+		c.addPod(p)
+	}
+
+	assert.False(t, c.HasModel("m-mix"), "port-0 bindings never register a routable model")
+	provider := any(c).(interface {
+		ModelClaimBinding(string) (*v1.Pod, int, string, bool)
+	})
+	pod, port, state, found := provider.ModelClaimBinding("m-mix")
+	require.True(t, found)
+	assert.Equal(t, "p-sleep", pod.Name)
+	assert.Zero(t, port)
+	assert.Equal(t, constants.ModelClaimRoutingStateSleeping, state)
+
+	// Without a sleeping binding, activating wins over failed.
+	c = NewForTest()
+	for _, p := range []*v1.Pod{
+		mk("p-failed", constants.ModelClaimRoutingStateFailed),
+		mk("p-boot", constants.ModelClaimRoutingStateActivating),
+	} {
+		c.addPod(p)
+	}
+	provider = any(c).(interface {
+		ModelClaimBinding(string) (*v1.Pod, int, string, bool)
+	})
+	pod, _, state, found = provider.ModelClaimBinding("m-mix")
+	require.True(t, found)
+	assert.Equal(t, "p-boot", pod.Name)
+	assert.Equal(t, constants.ModelClaimRoutingStateActivating, state)
+}
+
 func TestModelClaimStateClearedOnPodDelete(t *testing.T) {
 	c := NewForTest()
 	pod := warmModelClaimPod("p1", "default", map[string]int{"m": 0})

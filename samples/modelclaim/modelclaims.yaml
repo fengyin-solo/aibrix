@@ -31,3 +31,22 @@ spec:
   engineConfig:
     args:
       --max-model-len: "2048"
+---
+# Multi-replica serving: each replica is an independent engine on a distinct
+# warm pool Pod, so the pool must contain at least this many eligible Pods.
+apiVersion: model.aibrix.ai/v1alpha1
+kind: ModelClaim
+metadata:
+  name: qwen25-1-5b-ha
+  namespace: default
+spec:
+  modelName: qwen2.5-1.5b
+  podSelector:
+    matchLabels:
+      pool.aibrix.ai/name: b300-pool-a
+  artifactURL: huggingface://Qwen/Qwen2.5-1.5B-Instruct
+  engine: vllm
+  replicas: 3
+  engineConfig:
+    args:
+      --max-model-len: "4096"

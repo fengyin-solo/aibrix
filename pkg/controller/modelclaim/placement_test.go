@@ -152,7 +152,7 @@ func TestSelectPodForActivationWithStatePrefersLiveRuntimeState(t *testing.T) {
 	}
 
 	got, err := selectPodForActivationWithState(
-		candidates, map[string]bool{}, map[string]int{}, "m", uniformLocality{}, states,
+		candidates, map[string]bool{}, map[string]int{}, "m", uniformLocality{}, states, 0,
 	)
 	require.NoError(t, err)
 	assert.Equal(t, "hot", got.Name, "cached artifact wins before live memory tie-breakers")
@@ -178,10 +178,35 @@ func TestSelectPodForActivationWithStateRanksMemoryAndKV(t *testing.T) {
 	}
 
 	got, err := selectPodForActivationWithState(
-		candidates, map[string]bool{}, map[string]int{}, "m", uniformLocality{}, states,
+		candidates, map[string]bool{}, map[string]int{}, "m", uniformLocality{}, states, 0,
 	)
 	require.NoError(t, err)
 	assert.Equal(t, "free", got.Name, "higher free HBM wins before KV/model-count tie-breakers")
+}
+
+func TestSelectPodForActivationWithStateRanksKVThenModelCount(t *testing.T) {
+	// Equal artifact/snapshot/HBM: lower KV usage wins before model count.
+	candidates := []corev1.Pod{namedPod("kv-busy"), namedPod("kv-free")}
+	states := map[string]PodPlacementState{
+		"kv-busy": {SnapshotKnown: true, MemoryKnown: true, HBMFreeBytes: 500, KVUsedBytes: 300, ModelCount: 1},
+		"kv-free": {SnapshotKnown: true, MemoryKnown: true, HBMFreeBytes: 500, KVUsedBytes: 100, ModelCount: 3},
+	}
+
+	got, err := selectPodForActivationWithState(
+		candidates, map[string]bool{}, map[string]int{}, "m", uniformLocality{}, states, 0,
+	)
+	require.NoError(t, err)
+	assert.Equal(t, "kv-free", got.Name, "lower KV usage wins even with more models")
+
+	// Equal KV: fewer resident models wins.
+	equalKV := states["kv-free"]
+	equalKV.KVUsedBytes = 300
+	states["kv-free"] = equalKV
+	got, err = selectPodForActivationWithState(
+		candidates, map[string]bool{}, map[string]int{}, "m", uniformLocality{}, states, 0,
+	)
+	require.NoError(t, err)
+	assert.Equal(t, "kv-busy", got.Name, "fewer resident models wins on equal KV")
 }
 
 func TestSelectPodForActivationWithStateFallsBackForUnknownSnapshots(t *testing.T) {
@@ -193,9 +218,93 @@ func TestSelectPodForActivationWithStateFallsBackForUnknownSnapshots(t *testing.
 		"m",
 		uniformLocality{},
 		map[string]PodPlacementState{},
+		0,
 	)
 	require.NoError(t, err)
 	assert.Equal(t, "idle", got.Name)
+}
+
+func TestSelectPodForActivationWithStateFiltersPodsBelowHBMRequirement(t *testing.T) {
+	candidates := []corev1.Pod{namedPod("tight"), namedPod("roomy")}
+	states := map[string]PodPlacementState{
+		"tight": {SnapshotKnown: true, MemoryKnown: true, HBMFreeBytes: 500},
+		// Artifact cached here, but the HBM floor must still be enforced.
+		"roomy": {SnapshotKnown: true, ArtifactCached: true, MemoryKnown: true, HBMFreeBytes: 1000},
+	}
+
+	got, err := selectPodForActivationWithState(
+		candidates, map[string]bool{}, map[string]int{}, "m", uniformLocality{}, states, 800,
+	)
+	require.NoError(t, err)
+	assert.Equal(t, "roomy", got.Name, "a cached-artifact pod still must satisfy the HBM floor")
+
+	// Both pods short on HBM: a distinct error explains the scheduling stall.
+	_, err = selectPodForActivationWithState(
+		candidates, map[string]bool{}, map[string]int{}, "m", uniformLocality{}, states, 5000,
+	)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "HBM")
+}
+
+func TestSelectPodForActivationWithStateUnknownMemoryBypassesHBMRequirement(t *testing.T) {
+	// A requirement estimate exists, but a pod without readable free HBM must
+	// stay eligible (missing observability must not wedge scheduling).
+	candidates := []corev1.Pod{namedPod("dark")}
+	states := map[string]PodPlacementState{"dark": {SnapshotKnown: false, MemoryKnown: false}}
+
+	got, err := selectPodForActivationWithState(
+		candidates, map[string]bool{}, map[string]int{}, "m", uniformLocality{}, states, 800,
+	)
+	require.NoError(t, err)
+	assert.Equal(t, "dark", got.Name)
+}
+
+func TestSelectPodsForMultipleReplicasUseDistinctPods(t *testing.T) {
+	// Simulate the controller's sequential activation loop: each pick updates
+	// the used set and model-count view, so replicas never share a pod.
+	candidates := []corev1.Pod{namedPod("a"), namedPod("b"), namedPod("c")}
+	load := map[string]int{}
+	states := map[string]PodPlacementState{
+		"a": {SnapshotKnown: true, MemoryKnown: true, HBMFreeBytes: 100, KVUsedBytes: 10},
+		"b": {SnapshotKnown: true, MemoryKnown: true, HBMFreeBytes: 100, KVUsedBytes: 10},
+		"c": {SnapshotKnown: true, MemoryKnown: true, HBMFreeBytes: 100, KVUsedBytes: 10},
+	}
+	used := map[string]bool{}
+	var picked []string
+	for range 3 {
+		pod, err := selectPodForActivationWithState(
+			candidates, used, load, "m", uniformLocality{}, states, 0,
+		)
+		require.NoError(t, err)
+		picked = append(picked, pod.Name)
+		used[pod.Name] = true
+		load[pod.Name]++
+		state := states[pod.Name]
+		state.ModelCount++
+		states[pod.Name] = state
+	}
+	assert.ElementsMatch(t, []string{"a", "b", "c"}, picked)
+
+	// Fourth pick with every pod already used fails.
+	_, err := selectPodForActivationWithState(
+		candidates, used, load, "m", uniformLocality{}, states, 0,
+	)
+	require.Error(t, err)
+}
+
+func TestHbmRequirementFromSnapshots(t *testing.T) {
+	snapshots := map[string]*RuntimeSnapshot{
+		"p1": {Models: []RuntimeSnapshotModel{
+			{ArtifactURL: "hf://m", HBMPeakBytes: 800, KVCapacityBytes: 600},
+			{ArtifactURL: "hf://other", HBMPeakBytes: 9999},
+		}},
+		"p2": {Models: []RuntimeSnapshotModel{
+			{ArtifactURL: "hf://m", HBMPeakBytes: 700, KVCapacityBytes: 900},
+		}},
+	}
+	assert.Equal(t, int64(900), hbmRequirementFromSnapshots(snapshots, "hf://m"))
+	assert.Zero(t, hbmRequirementFromSnapshots(snapshots, "hf://unseen"))
+	assert.Zero(t, hbmRequirementFromSnapshots(nil, ""))
 }
 
 func TestUniformLocality_AlwaysZero(t *testing.T) {

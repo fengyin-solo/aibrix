@@ -63,6 +63,36 @@ func TestTargetAddressFallsBackToLabel(t *testing.T) {
 	assert.Equal(t, "10.0.0.9:8000", ctx.TargetAddress())
 }
 
+// Multiple Ready replicas of one served model route to each pod's own
+// annotation port, never a shared or default port.
+func TestTargetAddressMultiReplicaUsesPerPodPort(t *testing.T) {
+	podA := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "pa",
+			Annotations: map[string]string{
+				constants.ModelClaimPodAnnotationPrefix + "qwen": `{"model":"qwen-multi","port":9001,"state":"active"}`,
+			},
+		},
+		Status: v1.PodStatus{PodIP: "10.0.0.1"},
+	}
+	podB := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "pb",
+			Annotations: map[string]string{
+				constants.ModelClaimPodAnnotationPrefix + "qwen": `{"model":"qwen-multi","port":9002,"state":"active"}`,
+			},
+		},
+		Status: v1.PodStatus{PodIP: "10.0.0.2"},
+	}
+	ctxA := NewRoutingContext(context.Background(), "algo", "qwen-multi", "msg", "r1", "")
+	ctxA.SetTargetPod(podA)
+	assert.Equal(t, "10.0.0.1:9001", ctxA.TargetAddress())
+
+	ctxB := NewRoutingContext(context.Background(), "algo", "qwen-multi", "msg", "r2", "")
+	ctxB.SetTargetPod(podB)
+	assert.Equal(t, "10.0.0.2:9002", ctxB.TargetAddress())
+}
+
 // A known ModelClaim model held at the non-routable marker (port 0) must not
 // fall back to the default deployment port on the warm pool pod.
 func TestTargetAddressPortZeroIsNotRoutable(t *testing.T) {

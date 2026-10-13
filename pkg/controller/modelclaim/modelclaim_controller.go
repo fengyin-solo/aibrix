@@ -139,17 +139,10 @@ func (r *ModelClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	// Handle deletion: deactivate attached instances, then drop the finalizer.
+	// Handle deletion: every attached instance must be stopped and confirmed
+	// gone before the finalizer is released.
 	if !pm.DeletionTimestamp.IsZero() {
-		if controllerutil.ContainsFinalizer(pm, ModelClaimFinalizer) {
-			r.deactivateInstances(ctx, pm)
-			clearClaimMetrics(pm.Namespace, servedModelName(pm))
-			controllerutil.RemoveFinalizer(pm, ModelClaimFinalizer)
-			if err := r.Update(ctx, pm); err != nil {
-				return requeueOnConflict(err)
-			}
-		}
-		return ctrl.Result{}, nil
+		return r.reconcileDeletion(ctx, pm)
 	}
 
 	// Ensure the finalizer is present before doing any external-effecting work.
@@ -191,27 +184,23 @@ func (r *ModelClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	pruneDeadInstances(pm, candidates)
 	r.setStatusFields(pm, candidates)
 
-	// Drive the model towards its desired number of active instances by
-	// bin-packing onto warm pods and asking the runtime sidecar to activate it.
-	switch {
-	case desiredReplicas(pm) > int32(len(pm.Status.Instances)):
-		if err := r.ensureActivated(ctx, pm, candidates); err != nil {
-			r.Recorder.Event(pm, corev1.EventTypeWarning, "ActivateFailed", err.Error())
-			meta.SetStatusCondition(&pm.Status.Conditions, metav1.Condition{
-				Type:    string(modelv1alpha1.ModelClaimConditionReady),
-				Status:  metav1.ConditionFalse,
-				Reason:  "ActivateFailed",
-				Message: err.Error(),
-			})
-			pm.Status.Phase = modelv1alpha1.ModelClaimFailed
-			setClaimGauges(pm)
-			if uerr := r.Status().Update(ctx, pm); uerr != nil {
-				return requeueOnConflict(uerr)
-			}
-			return ctrl.Result{RequeueAfter: DefaultRequeueDuration}, nil
+	// Convene the desired instance set: activate replacements/extra replicas
+	// on distinct warm pods, replay terminal failures, and stop surplus
+	// instances under the healthy-instance guard (see scaling.go).
+	if err := r.convergeInstances(ctx, pm, candidates); err != nil {
+		r.Recorder.Event(pm, corev1.EventTypeWarning, "ActivateFailed", err.Error())
+		meta.SetStatusCondition(&pm.Status.Conditions, metav1.Condition{
+			Type:    string(modelv1alpha1.ModelClaimConditionReady),
+			Status:  metav1.ConditionFalse,
+			Reason:  "ActivateFailed",
+			Message: err.Error(),
+		})
+		pm.Status.Phase = modelv1alpha1.ModelClaimFailed
+		setClaimGauges(pm)
+		if uerr := r.Status().Update(ctx, pm); uerr != nil {
+			return requeueOnConflict(uerr)
 		}
-	case desiredReplicas(pm) < int32(len(pm.Status.Instances)):
-		r.scaleDown(ctx, pm, desiredReplicas(pm))
+		return ctrl.Result{RequeueAfter: DefaultRequeueDuration}, nil
 	}
 
 	// Reconcile instance routability against live engine readiness (promote
@@ -325,39 +314,67 @@ func (r *ModelClaimReconciler) setStatusFields(pm *modelv1alpha1.ModelClaim, can
 func (r *ModelClaimReconciler) recomputeReadiness(pm *modelv1alpha1.ModelClaim) {
 	// Only instances whose engine is serveable (Active) count as ready. An
 	// Activating instance has a spawned-but-not-serveable engine, and its
-	// warm-pod annotation is still the non-routable marker (port 0), so it is NOT
-	// routable and must not inflate ReadyReplicas.
+	// warm-pod annotation is still the non-routable marker (port 0), so it is
+	// NOT routable and must not inflate ReadyReplicas.
 	active := 0
 	sleeping := 0
 	failed := 0
 	for i := range pm.Status.Instances {
-		if pm.Status.Instances[i].Phase == modelv1alpha1.ModelClaimActive {
+		switch pm.Status.Instances[i].Phase {
+		case modelv1alpha1.ModelClaimActive:
 			active++
-		}
-		if pm.Status.Instances[i].Phase == modelv1alpha1.ModelClaimSleeping {
+		case modelv1alpha1.ModelClaimSleeping:
 			sleeping++
-		}
-		if pm.Status.Instances[i].Phase == modelv1alpha1.ModelClaimFailed {
+		case modelv1alpha1.ModelClaimFailed:
 			failed++
 		}
 	}
 	pm.Status.ReadyReplicas = int32(active)
 	switch {
-	case failed > 0:
-		pm.Status.Phase = modelv1alpha1.ModelClaimFailed
-		meta.SetStatusCondition(&pm.Status.Conditions, metav1.Condition{
-			Type:    string(modelv1alpha1.ModelClaimConditionReady),
-			Status:  metav1.ConditionFalse,
-			Reason:  "EngineFailed",
-			Message: "one or more model engine instances exhausted local restart attempts",
-		})
 	case len(pm.Status.Instances) > 0 && active == len(pm.Status.Instances):
+		// Every instance is serveable: the claim is fully Active.
 		pm.Status.Phase = modelv1alpha1.ModelClaimActive
 		meta.SetStatusCondition(&pm.Status.Conditions, metav1.Condition{
 			Type:    string(modelv1alpha1.ModelClaimConditionReady),
 			Status:  metav1.ConditionTrue,
 			Reason:  "ModelClaimActive",
-			Message: "model is active on at least one warm pod",
+			Message: "all model engine instances are active and routable",
+		})
+	case active > 0 && failed == 0 && sleeping > 0:
+		// Some replicas serve while others are intentionally asleep: report
+		// Sleeping; the gateway keeps routing to the Active instances.
+		pm.Status.Phase = modelv1alpha1.ModelClaimSleeping
+		meta.SetStatusCondition(&pm.Status.Conditions, metav1.Condition{
+			Type:    string(modelv1alpha1.ModelClaimConditionReady),
+			Status:  metav1.ConditionFalse,
+			Reason:  "EngineSleeping",
+			Message: "one or more model engine instances are sleeping while others serve",
+		})
+	case active > 0:
+		// Partially serving: other replicas are booting or being replayed.
+		// The gateway keeps routing to the ready instances while the claim
+		// converges; the Ready condition stays False until every desired
+		// instance is serveable.
+		pm.Status.Phase = modelv1alpha1.ModelClaimActivating
+		reason, message := "EngineStarting", "one or more engine instances are not ready yet"
+		if failed > 0 {
+			reason, message = "InstanceFailed", "one or more engine instances failed and are being replayed"
+		}
+		meta.SetStatusCondition(&pm.Status.Conditions, metav1.Condition{
+			Type:    string(modelv1alpha1.ModelClaimConditionReady),
+			Status:  metav1.ConditionFalse,
+			Reason:  reason,
+			Message: message,
+		})
+	case failed > 0:
+		// No serveable instance remains: the claim is unavailable until a
+		// replay activation becomes ready.
+		pm.Status.Phase = modelv1alpha1.ModelClaimFailed
+		meta.SetStatusCondition(&pm.Status.Conditions, metav1.Condition{
+			Type:    string(modelv1alpha1.ModelClaimConditionReady),
+			Status:  metav1.ConditionFalse,
+			Reason:  "EngineFailed",
+			Message: "all model engine instances are failed; waiting for replay",
 		})
 	case sleeping > 0:
 		pm.Status.Phase = modelv1alpha1.ModelClaimSleeping
@@ -382,21 +399,76 @@ func (r *ModelClaimReconciler) recomputeReadiness(pm *modelv1alpha1.ModelClaim) 
 	}
 }
 
-// ensureActivated brings the model up to its desired replica count by selecting
-// warm pods and asking the runtime sidecar to activate an engine process on
-// each. Lack of an available warm pod is not an error (the model stays Pending and
-// reconciles again); only runtime failures propagate.
-func (r *ModelClaimReconciler) ensureActivated(ctx context.Context, pm *modelv1alpha1.ModelClaim, candidates []corev1.Pod) error {
+// placementInputs gathers the cross-claim load map and the per-pod runtime
+// placement summaries (including the estimated HBM requirement) once per
+// converge pass, so activation, replay, and scale-down all decide on the same
+// point-in-time observation.
+func (r *ModelClaimReconciler) placementInputs(
+	ctx context.Context,
+	pm *modelv1alpha1.ModelClaim,
+	candidates []corev1.Pod,
+) (map[string]int, map[string]PodPlacementState, int64, error) {
 	load := r.computePodLoad(ctx, pm.Namespace)
 	parallelism, err := modelParallelism(pm)
 	if err != nil {
-		return fmt.Errorf("invalid engineConfig parallelism: %w", err)
+		return nil, nil, 0, fmt.Errorf("invalid engineConfig parallelism: %w", err)
 	}
-	placementStates := r.collectPlacementStates(ctx, candidates, pm.Spec.ArtifactURL, parallelism)
+	states, hbmRequired := r.collectPlacementStates(ctx, candidates, pm.Spec.ArtifactURL, parallelism)
+	return load, states, hbmRequired, nil
+}
 
-	for desiredReplicas(pm) > int32(len(pm.Status.Instances)) {
+// convergeInstances drives the claim towards its desired instance set.
+//
+// Safety order within one pass:
+//  1. activate scale-up slots and terminal-failure replacements on DISTINCT
+//     warm pods first (a failed instance keeps occupying its slot, and its pod
+//     is excluded, until the replacement is up);
+//  2. a terminal failure with no distinct candidate is released for a
+//     same-pod retry only when no replacement is still booting and the claim
+//     is not already serving desired from healthy instances;
+//  3. stop surplus instances through selectScaleDownVictim, which never
+//     removes a serveable instance while ready count would drop below desired.
+//
+// Lack of an available warm pod is not an error (Pending + requeue); runtime
+// activation failures propagate to the caller's Failed/Retry handling.
+func (r *ModelClaimReconciler) convergeInstances(ctx context.Context, pm *modelv1alpha1.ModelClaim, candidates []corev1.Pod) error {
+	desired := desiredReplicas(pm)
+	load, states, hbmRequired, err := r.placementInputs(ctx, pm, candidates)
+	if err != nil {
+		return err
+	}
+
+	// 1. Activate up to desired + failed: each failed record reserves a
+	// temporary extra slot for its replacement so the old instance can be
+	// stopped only after the new one is ready.
+	target := desired + int32(countPhase(pm, modelv1alpha1.ModelClaimFailed))
+	if err := r.activateToTarget(ctx, pm, candidates, target, load, states, hbmRequired); err != nil {
+		return err
+	}
+
+	// 2. Release terminal failures that cannot get a distinct replacement, so
+	// the next pass can re-activate (possibly on the same warm pod).
+	r.releaseFailedForSamePodRetry(ctx, pm, candidates, load, states, hbmRequired)
+
+	// 3. Stop surplus instances under the healthy-instance guard.
+	r.scaleDownGuarded(ctx, pm, desired)
+	return nil
+}
+
+// activateToTarget activates engines on distinct warm pods until the instance
+// count reaches target. No available pod is a non-error scheduling wait.
+func (r *ModelClaimReconciler) activateToTarget(
+	ctx context.Context,
+	pm *modelv1alpha1.ModelClaim,
+	candidates []corev1.Pod,
+	target int32,
+	load map[string]int,
+	placementStates map[string]PodPlacementState,
+	hbmRequired int64,
+) error {
+	for int32(len(pm.Status.Instances)) < target {
 		pod, selectErr := selectPodForActivationWithState(
-			candidates, instancePods(pm), load, servedModelName(pm), r.Locality, placementStates,
+			candidates, instancePods(pm), load, servedModelName(pm), r.Locality, placementStates, hbmRequired,
 		)
 		if selectErr != nil {
 			// No available warm pod right now; remain Pending and retry on requeue.
@@ -442,21 +514,77 @@ func (r *ModelClaimReconciler) ensureActivated(ctx context.Context, pm *modelv1a
 			Phase: modelv1alpha1.ModelClaimActivating,
 		})
 		load[pod.Name]++
+		// The engine is booting, so its HBM/KV footprint is not yet observable.
+		// Account for the placement itself (one more resident model on this pod)
+		// so a second replica activated in the same pass cannot be ranked onto
+		// the pod that was just selected. alreadyOn excludes it outright; the
+		// model-count bump keeps cross-pod ranking consistent.
+		if state, ok := placementStates[pod.Name]; ok {
+			state.ModelCount++
+			placementStates[pod.Name] = state
+		}
 		r.Recorder.Eventf(pm, corev1.EventTypeNormal, "Activating",
 			"model %s engine starting on pod %s:%d", servedModelName(pm), pod.Name, resp.Port)
 	}
 	return nil
 }
 
+// releaseFailedForSamePodRetry handles terminal-failed instances for which no
+// DISTINCT warm pod exists: the failed engine is stopped and its record dropped
+// so the normal activation path can retry on the same pod on the next pass.
+//
+// It deliberately does nothing while a replacement is still booting on another
+// pod (the replacement-first ordering) or while desired is already served by
+// healthy instances (scale-down reaps the failed record instead). At most one
+// record is released per pass per pod-set to keep retries paced by requeue.
+func (r *ModelClaimReconciler) releaseFailedForSamePodRetry(
+	ctx context.Context,
+	pm *modelv1alpha1.ModelClaim,
+	candidates []corev1.Pod,
+	load map[string]int,
+	states map[string]PodPlacementState,
+	hbmRequired int64,
+) {
+	desired := desiredReplicas(pm)
+	ready := int32(countPhase(pm, modelv1alpha1.ModelClaimActive))
+	activating := countPhase(pm, modelv1alpha1.ModelClaimActivating)
+	if ready >= desired || activating > 0 {
+		return
+	}
+	for i := range pm.Status.Instances {
+		inst := &pm.Status.Instances[i]
+		if inst.Phase != modelv1alpha1.ModelClaimFailed {
+			continue
+		}
+		// A distinct candidate (excluding every pod this claim already occupies)
+		// means the replacement-first path is in charge, not same-pod retry.
+		if _, err := selectPodForActivationWithState(
+			candidates, instancePods(pm), load, servedModelName(pm), r.Locality, states, hbmRequired,
+		); err == nil {
+			return
+		}
+		r.Recorder.Eventf(pm, corev1.EventTypeNormal, "ReplayFailedInstance",
+			"model %s has no distinct warm pod; releasing failed instance on pod %s for same-pod retry",
+			servedModelName(pm), inst.Pod)
+		r.stopInstance(ctx, pm, *inst)
+		pm.Status.Instances = removeInstanceAt(pm.Status.Instances, i)
+		return
+	}
+}
+
+// collectPlacementStates summarizes runtime snapshots for every candidate and
+// additionally estimates the per-instance HBM requirement from engines of the
+// same artifact already observed in the pool.
 func (r *ModelClaimReconciler) collectPlacementStates(
 	ctx context.Context,
 	candidates []corev1.Pod,
 	artifactURL string,
 	parallelism int64,
-) map[string]PodPlacementState {
+) (map[string]PodPlacementState, int64) {
 	states := make(map[string]PodPlacementState, len(candidates))
+	snapshots := make(map[string]*RuntimeSnapshot, len(candidates))
 	if r.SnapshotCache == nil {
-		return states
+		return states, 0
 	}
 	for i := range candidates {
 		pod := &candidates[i]
@@ -467,10 +595,10 @@ func (r *ModelClaimReconciler) collectPlacementStates(
 		if !ok {
 			continue
 		}
-		state := placementStateFromSnapshot(snapshot, artifactURL, parallelism)
-		states[pod.Name] = state
+		snapshots[pod.Name] = snapshot
+		states[pod.Name] = placementStateFromSnapshot(snapshot, artifactURL, parallelism)
 	}
-	return states
+	return states, hbmRequirementFromSnapshots(snapshots, artifactURL)
 }
 
 // reconcileInstanceHealth reconciles routing from fresh runtime snapshot data.
@@ -506,8 +634,6 @@ func (r *ModelClaimReconciler) reconcileInstanceHealth(ctx context.Context, pm *
 		desiredPhase := modelv1alpha1.ModelClaimActivating
 		routingPort := int32(0)
 		switch {
-		case inst.Phase == modelv1alpha1.ModelClaimFailed:
-			desiredPhase = modelv1alpha1.ModelClaimFailed
 		case observed != nil && observed.Phase == runtimePhaseFailed:
 			desiredPhase = modelv1alpha1.ModelClaimFailed
 		case observed != nil && observed.Phase == runtimePhaseSleeping:
@@ -515,6 +641,30 @@ func (r *ModelClaimReconciler) reconcileInstanceHealth(ctx context.Context, pm *
 		case observed != nil && observed.Ready && observedPort > 0:
 			desiredPhase = modelv1alpha1.ModelClaimActive
 			routingPort = observedPort
+		case observed != nil:
+			// Alive but not serveable (booting, compiling, restarting): keep
+			// it off the routable set until the next readiness observation.
+			desiredPhase = modelv1alpha1.ModelClaimActivating
+		case inst.Phase == modelv1alpha1.ModelClaimActive ||
+			inst.Phase == modelv1alpha1.ModelClaimSleeping:
+			// The snapshot succeeded but a previously resident engine is no
+			// longer reported by the runtime: the process vanished. Treat it
+			// as terminal so the failure-replay path replaces it.
+			desiredPhase = modelv1alpha1.ModelClaimFailed
+		default:
+			// An Activating engine may briefly lag the runtime's model list
+			// right after activation; do not flap it to Failed on one
+			// observation. A Failed record stays Failed until the converge
+			// pass releases or replaces it.
+			desiredPhase = inst.Phase
+		}
+
+		// Observed readiness/restart counters mirror the runtime; on a missing
+		// engine the instance is plainly not ready while the last restart
+		// count is retained for status continuity.
+		inst.Ready = observed != nil && observed.Ready && observedPort > 0
+		if observed != nil {
+			inst.RestartCount = int32(observed.RestartCount)
 		}
 
 		pod := &corev1.Pod{}
@@ -535,11 +685,14 @@ func (r *ModelClaimReconciler) reconcileInstanceHealth(ctx context.Context, pm *
 		inst.Phase = desiredPhase
 		switch desiredPhase {
 		case modelv1alpha1.ModelClaimFailed:
-			message := "runtime reported terminal engine failure"
-			if observed != nil && observed.LastError != "" {
+			reason, message := "EngineFailed", "runtime reported terminal engine failure"
+			switch {
+			case observed != nil && observed.LastError != "":
 				message = observed.LastError
+			case observed == nil:
+				reason, message = "EngineGone", "engine process disappeared from the runtime model list"
 			}
-			r.Recorder.Eventf(pm, corev1.EventTypeWarning, "EngineFailed",
+			r.Recorder.Eventf(pm, corev1.EventTypeWarning, reason,
 				"model %s failed on pod %s: %s", served, inst.Pod, message)
 		case modelv1alpha1.ModelClaimActive:
 			if previousPhase == modelv1alpha1.ModelClaimActivating {
@@ -649,40 +802,98 @@ func (r *ModelClaimReconciler) deannotateWarmPod(ctx context.Context, namespace,
 	}
 }
 
-// scaleDown deactivates surplus instances until the desired count is met.
-func (r *ModelClaimReconciler) scaleDown(ctx context.Context, pm *modelv1alpha1.ModelClaim, target int32) {
-	for int32(len(pm.Status.Instances)) > target && len(pm.Status.Instances) > 0 {
-		idx := len(pm.Status.Instances) - 1
-		inst := pm.Status.Instances[idx]
-		r.deannotateWarmPod(ctx, pm.Namespace, inst.Pod, pm.Name)
-		if ip := r.podIP(ctx, pm.Namespace, inst.Pod); ip != "" {
-			if err := r.Runtime.Deactivate(ctx, ip, DefaultRuntimePort, &DeactivateRequest{
-				ModelName: servedModelName(pm),
-				Mode:      DeactivateStop,
-			}); err != nil {
-				klog.ErrorS(err, "scale-down deactivate failed", "pod", inst.Pod, "model", pm.Name)
-			}
+// scaleDownGuarded deactivates surplus instances one at a time using
+// selectScaleDownVictim's ordering and safety guards. A -1 victim means the
+// claim must wait (for a replacement to become ready, or for a healthy
+// replacement to exist): the surplus record is kept rather than stopping the
+// only healthy engine.
+func (r *ModelClaimReconciler) scaleDownGuarded(ctx context.Context, pm *modelv1alpha1.ModelClaim, target int32) {
+	for int32(len(pm.Status.Instances)) > target {
+		idx := selectScaleDownVictim(pm.Status.Instances, target)
+		if idx < 0 {
+			return
 		}
-		pm.Status.Instances = pm.Status.Instances[:idx]
+		inst := pm.Status.Instances[idx]
+		r.stopInstance(ctx, pm, inst)
+		pm.Status.Instances = removeInstanceAt(pm.Status.Instances, idx)
 	}
 }
 
-// deactivateInstances best-effort stops every engine instance of the model,
-// used on deletion before the finalizer is removed.
-func (r *ModelClaimReconciler) deactivateInstances(ctx context.Context, pm *modelv1alpha1.ModelClaim) {
+// stopInstance de-routes and stops one engine instance. Runtime teardown is
+// best-effort: the pod/engine may already be gone, and the next health pass
+// reconciles any residual state. The caller is responsible for removing the
+// status record.
+func (r *ModelClaimReconciler) stopInstance(ctx context.Context, pm *modelv1alpha1.ModelClaim, inst modelv1alpha1.ModelClaimInstance) {
+	r.deannotateWarmPod(ctx, pm.Namespace, inst.Pod, pm.Name)
+	ip := r.podIP(ctx, pm.Namespace, inst.Pod)
+	if ip == "" {
+		return
+	}
+	if err := r.Runtime.Deactivate(ctx, ip, DefaultRuntimePort, &DeactivateRequest{
+		ModelName: servedModelName(pm),
+		Mode:      DeactivateStop,
+	}); err != nil {
+		klog.ErrorS(err, "deactivate failed", "pod", inst.Pod, "model", pm.Name)
+	}
+}
+
+// reconcileDeletion stops every engine instance and only releases the
+// finalizer after each stop is confirmed: a vanished pod counts as confirmed,
+// otherwise the runtime deactivate must succeed AND a follow-up snapshot must
+// no longer report the claim's engine. Unconfirmed instances are retained in
+// status (persisted so a controller restart resumes the wait) and the claim
+// requeues. This guarantees a deleting ModelClaim never leaves live engines
+// behind just because one teardown failed or lagged.
+func (r *ModelClaimReconciler) reconcileDeletion(ctx context.Context, pm *modelv1alpha1.ModelClaim) (ctrl.Result, error) {
+	if !controllerutil.ContainsFinalizer(pm, ModelClaimFinalizer) {
+		return ctrl.Result{}, nil
+	}
+	served := servedModelName(pm)
+	remaining := make([]modelv1alpha1.ModelClaimInstance, 0, len(pm.Status.Instances))
 	for _, inst := range pm.Status.Instances {
 		r.deannotateWarmPod(ctx, pm.Namespace, inst.Pod, pm.Name)
 		ip := r.podIP(ctx, pm.Namespace, inst.Pod)
 		if ip == "" {
-			continue // pod already gone; nothing to stop
+			continue // pod already gone; nothing left to stop
 		}
 		if err := r.Runtime.Deactivate(ctx, ip, DefaultRuntimePort, &DeactivateRequest{
-			ModelName: servedModelName(pm),
+			ModelName: served,
 			Mode:      DeactivateStop,
 		}); err != nil {
 			klog.ErrorS(err, "deactivate on delete failed", "pod", inst.Pod, "model", pm.Name)
+			remaining = append(remaining, inst)
+			continue
+		}
+		// Confirm the engine actually disappeared rather than assuming the
+		// stop was synchronous. A snapshot error keeps the finalizer in
+		// place; the next pass retries.
+		snapshot, err := r.Runtime.Snapshot(ctx, ip, DefaultRuntimePort)
+		if err != nil {
+			klog.ErrorS(err, "post-deactivate snapshot failed; keeping finalizer", "pod", inst.Pod, "model", pm.Name)
+			remaining = append(remaining, inst)
+			continue
+		}
+		if snapshotModelForClaim(snapshot, pm, served) != nil {
+			klog.InfoS("engine still reported after deactivate; keeping finalizer", "pod", inst.Pod, "model", pm.Name)
+			remaining = append(remaining, inst)
 		}
 	}
+	pm.Status.Instances = remaining
+
+	if len(remaining) > 0 {
+		r.Recorder.Eventf(pm, corev1.EventTypeWarning, "DeletionWaiting",
+			"model %s deletion is waiting for %d engine instance(s) to stop", served, len(remaining))
+		setClaimGauges(pm)
+		_ = r.Status().Update(ctx, pm) // best-effort persistence for restart resume
+		return ctrl.Result{RequeueAfter: DefaultRequeueDuration}, nil
+	}
+
+	clearClaimMetrics(pm.Namespace, served)
+	controllerutil.RemoveFinalizer(pm, ModelClaimFinalizer)
+	if err := r.Update(ctx, pm); err != nil {
+		return requeueOnConflict(err)
+	}
+	return ctrl.Result{}, nil
 }
 
 // computePodLoad tallies how many model instances each warm pod currently hosts,

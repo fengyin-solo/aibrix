@@ -52,13 +52,12 @@ type ModelClaimSpec struct {
 	Engine string `json:"engine,omitempty"`
 
 	// Replicas is the desired number of active engine instances for this model
-	// inside the selected resource pool. For the initial high-density path the
-	// supported and default value is 1; the field is retained as the model-level
-	// serving slot count rather than a Kubernetes Deployment replica count.
+	// inside the selected resource pool. Each replica is an independent engine
+	// process placed on a distinct warm GPU pod; the controller schedules,
+	// rolls, and replays replicas as a group. Defaults to 1.
 	// +optional
 	// +kubebuilder:default=1
 	// +kubebuilder:validation:Minimum=1
-	// +kubebuilder:validation:Maximum=1
 	Replicas *int32 `json:"replicas,omitempty"`
 
 	// EngineConfig carries engine-specific startup options. Args maps engine
@@ -118,6 +117,17 @@ type ModelClaimInstance struct {
 	// Phase is the per-instance lifecycle phase.
 	// +optional
 	Phase ModelClaimPhase `json:"phase,omitempty"`
+
+	// Ready mirrors the runtime's engine readiness probe: only a ready
+	// instance is advertised on its warm pod with a real port and routed by
+	// the gateway.
+	// +optional
+	Ready bool `json:"ready,omitempty"`
+
+	// RestartCount is the runtime-reported number of engine process restarts
+	// for this instance, used to observe crash/replay churn.
+	// +optional
+	RestartCount int32 `json:"restartCount,omitempty"`
 }
 
 // ModelClaimStatus defines the observed state of ModelClaim.

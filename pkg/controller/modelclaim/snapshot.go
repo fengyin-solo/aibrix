@@ -102,6 +102,37 @@ type PodPlacementState struct {
 	ModelCount     int
 }
 
+// hbmRequirementFromSnapshots estimates the per-instance HBM footprint for an
+// artifact from engines of the SAME artifact already running on candidate
+// pods: the maximum observed peak usage and configured KV capacity, both of
+// which the new engine must fit alongside co-tenant engines. Zero means no
+// observation is available and the scheduler must not apply a hard HBM
+// filter rather than guessing a requirement.
+func hbmRequirementFromSnapshots(snapshots map[string]*RuntimeSnapshot, artifactURL string) int64 {
+	if artifactURL == "" {
+		return 0
+	}
+	var required int64
+	for _, snapshot := range snapshots {
+		if snapshot == nil {
+			continue
+		}
+		for i := range snapshot.Models {
+			model := &snapshot.Models[i]
+			if model.ArtifactURL != artifactURL {
+				continue
+			}
+			if model.HBMPeakBytes > required {
+				required = model.HBMPeakBytes
+			}
+			if model.KVCapacityBytes > required {
+				required = model.KVCapacityBytes
+			}
+		}
+	}
+	return required
+}
+
 func placementStateFromSnapshot(snapshot *RuntimeSnapshot, artifactURL string, parallelism int64) PodPlacementState {
 	state := PodPlacementState{SnapshotKnown: true, ModelCount: len(snapshot.Models)}
 	for _, cached := range snapshot.CachedArtifacts {

@@ -117,6 +117,23 @@ func TestSetClaimGauges(t *testing.T) {
 		assert.Equal(t, 0.0, testutil.ToFloat64(claimActivating.WithLabelValues("obs", "gauge-active")))
 	})
 
+	t.Run("multi replica partial readiness", func(t *testing.T) {
+		pm := &modelv1alpha1.ModelClaim{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "obs", Name: "gauge-multi"},
+			Status: modelv1alpha1.ModelClaimStatus{
+				DesiredReplicas: 3, ReadyReplicas: 2,
+				Instances: []modelv1alpha1.ModelClaimInstance{
+					{Pod: "p1", Phase: modelv1alpha1.ModelClaimActive},
+					{Pod: "p2", Phase: modelv1alpha1.ModelClaimActive},
+					{Pod: "p3", Phase: modelv1alpha1.ModelClaimActivating},
+				},
+			},
+		}
+		setClaimGauges(pm)
+		assert.Equal(t, 3.0, testutil.ToFloat64(claimDesiredReplicas.WithLabelValues("obs", "gauge-multi")))
+		assert.Equal(t, 2.0, testutil.ToFloat64(claimReadyReplicas.WithLabelValues("obs", "gauge-multi")))
+	})
+
 	t.Run("activating", func(t *testing.T) {
 		now := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
 		pm := &modelv1alpha1.ModelClaim{

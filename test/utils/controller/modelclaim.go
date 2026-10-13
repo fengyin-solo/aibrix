@@ -22,6 +22,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sort"
+	"strconv"
 	"sync"
 	"time"
 
@@ -38,58 +40,72 @@ import (
 	modelclaimcontroller "github.com/vllm-project/aibrix/pkg/controller/modelclaim"
 )
 
-// ModelClaimFixture owns the client dependencies and fake runtime for a ModelClaim scenario.
+const modelClaimRuntimeListenPort = modelclaimcontroller.DefaultRuntimePort
+
+// ModelClaimFixture owns the client dependencies and a fleet of per-pod fake
+// runtimes for ModelClaim scenarios. Every warm pod gets its own runtime
+// simulation on a distinct loopback alias (127.0.0.x:8080), so multi-replica
+// placements observe independent per-pod engine state.
 type ModelClaimFixture struct {
 	ctx      context.Context
 	client   client.Client
 	timeout  time.Duration
 	interval time.Duration
-	runtime  *FakeModelClaimRuntime
+
+	mu           sync.Mutex
+	pods         map[string]*fakePodRuntime
+	defaultPhase string
+	defaultReady bool
+	nextPort     int32
+	nextAlias    int
+
+	activateFailures   int
+	deactivateFailures int
 }
 
-// NewModelClaimFixture starts a runtime, registers cleanup, and configures the scenario's polling helpers.
+// NewModelClaimFixture configures polling helpers and an empty runtime fleet.
 func NewModelClaimFixture(ctx context.Context, c client.Client, timeout, interval time.Duration) *ModelClaimFixture {
 	ginkgo.GinkgoHelper()
-	fake := &FakeModelClaimRuntime{
+	f := &ModelClaimFixture{
+		ctx:          ctx,
+		client:       c,
+		timeout:      timeout,
+		interval:     interval,
+		pods:         map[string]*fakePodRuntime{},
 		defaultPhase: "active",
 		defaultReady: true,
 		nextPort:     19000,
-		models:       map[string]modelclaimcontroller.RuntimeSnapshotModel{},
+		nextAlias:    2, // 127.0.0.2, .3, ... each bound to the runtime port
 	}
-	fake.ip = FindBindableNonLoopbackIPv4(modelclaimcontroller.DefaultRuntimePort)
-	fake.server = StartFixedPortHTTPServer(
-		fake.ip, modelclaimcontroller.DefaultRuntimePort, fake, 5*time.Second, 50*time.Millisecond,
-	)
-	fixture := &ModelClaimFixture{
-		ctx:      ctx,
-		client:   c,
-		timeout:  timeout,
-		interval: interval,
-		runtime:  fake,
-	}
-	ginkgo.DeferCleanup(fixture.Close)
-	return fixture
+	ginkgo.DeferCleanup(f.Close)
+	return f
 }
 
-// Runtime returns the fake runtime used by this fixture.
-func (f *ModelClaimFixture) Runtime() *FakeModelClaimRuntime {
+// Runtime returns the fleet-wide facade used to steer and observe all per-pod
+// fake runtimes.
+func (f *ModelClaimFixture) Runtime() *FakeModelClaimFleet {
 	ginkgo.GinkgoHelper()
-	return f.runtime
+	return &FakeModelClaimFleet{fixture: f}
 }
 
-// Close stops the fixture runtime and tolerates incomplete setup.
+// Close stops every per-pod fake runtime.
 func (f *ModelClaimFixture) Close() {
 	ginkgo.GinkgoHelper()
-	if f != nil && f.runtime != nil {
-		f.runtime.Close()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, rt := range f.pods {
+		rt.close()
 	}
+	f.pods = map[string]*fakePodRuntime{}
 }
 
-// CreateClaim creates a ModelClaim with the integration runtime defaults.
+// CreateClaim creates a ModelClaim; the trailing variadic sets spec.replicas
+// (defaults to 1).
 func (f *ModelClaimFixture) CreateClaim(
 	namespace, name, pool string,
 	modelName *string,
 	engineArgs map[string]string,
+	replicas ...int32,
 ) *modelapi.ModelClaim {
 	ginkgo.GinkgoHelper()
 	claim := &modelapi.ModelClaim{
@@ -101,6 +117,10 @@ func (f *ModelClaimFixture) CreateClaim(
 			Engine:      "vllm",
 		},
 	}
+	if len(replicas) > 0 {
+		r := replicas[0]
+		claim.Spec.Replicas = &r
+	}
 	if engineArgs != nil {
 		claim.Spec.EngineConfig = &modelapi.ModelClaimEngineConfig{Args: engineArgs}
 	}
@@ -109,9 +129,10 @@ func (f *ModelClaimFixture) CreateClaim(
 	return claim
 }
 
-// CreateWarmPod creates a running pool pod pointing to the fixture runtime.
+// CreateWarmPod creates a running pool pod backed by its own fake runtime.
 func (f *ModelClaimFixture) CreateWarmPod(namespace, name, pool string) *corev1.Pod {
 	ginkgo.GinkgoHelper()
+	rt := f.newPodRuntime(name)
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
@@ -125,9 +146,60 @@ func (f *ModelClaimFixture) CreateWarmPod(namespace, name, pool string) *corev1.
 	}
 	gomega.Expect(f.client.Create(f.ctx, pod)).To(gomega.Succeed())
 	pod.Status.Phase = corev1.PodRunning
-	pod.Status.PodIP = f.runtime.IP()
+	pod.Status.PodIP = rt.ip
 	gomega.Expect(f.client.Status().Update(f.ctx, pod)).To(gomega.Succeed())
 	return pod
+}
+
+func (f *ModelClaimFixture) newPodRuntime(name string) *fakePodRuntime {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	gomega.Expect(f.pods).NotTo(gomega.HaveKey(name), "duplicate warm pod name in fixture")
+	ip := "127.0.0." + strconv.Itoa(f.nextAlias)
+	f.nextAlias++
+	rt := &fakePodRuntime{
+		name:         name,
+		ip:           ip,
+		fixture:      f,
+		defaultPhase: f.defaultPhase,
+		defaultReady: f.defaultReady,
+		models:       map[string]modelclaimcontroller.RuntimeSnapshotModel{},
+	}
+	rt.server = StartFixedPortHTTPServer(
+		ip, modelClaimRuntimeListenPort, rt, 5*time.Second, 50*time.Millisecond,
+	)
+	f.pods[name] = rt
+	return rt
+}
+
+func (f *ModelClaimFixture) allocPort() int32 {
+	f.nextPort++
+	return f.nextPort
+}
+
+// runtimeForPod finds the fake runtime behind a pod name.
+func (f *ModelClaimFixture) runtimeForPod(name string) (*fakePodRuntime, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	rt, ok := f.pods[name]
+	return rt, ok
+}
+
+func (f *ModelClaimFixture) forEachPodRuntime(fn func(*fakePodRuntime)) {
+	f.mu.Lock()
+	names := make([]string, 0, len(f.pods))
+	for name := range f.pods {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	runtimes := make([]*fakePodRuntime, 0, len(names))
+	for _, name := range names {
+		runtimes = append(runtimes, f.pods[name])
+	}
+	f.mu.Unlock()
+	for _, rt := range runtimes {
+		fn(rt)
+	}
 }
 
 // GetClaim retrieves the latest claim using the supplied polling assertions.
@@ -174,7 +246,7 @@ func (f *ModelClaimFixture) ExpectRoute(
 	annotation := pod.Annotations[constants.ModelClaimPodAnnotationPrefix+claimName]
 	route, err := decodeModelClaimRouteAnnotation(annotation)
 	g.Expect(err).NotTo(gomega.HaveOccurred())
-	g.Expect(route.Port).To(gomega.Equal(port))
+	g.Expect(route.Port).To(gomega.BeNumerically("==", port))
 	g.Expect(route.State).To(gomega.Equal(state))
 }
 
@@ -207,110 +279,126 @@ func (f *ModelClaimFixture) ExpectEvent(claim *modelapi.ModelClaim, eventType, r
 	}, f.timeout, f.interval).Should(gomega.BeTrue())
 }
 
-// FakeModelClaimRuntime serves controllable runtime responses for ModelClaim tests.
-type FakeModelClaimRuntime struct {
-	mu sync.Mutex
+// fakePodRuntime simulates one warm pod's aibrix-runtime process.
+type fakePodRuntime struct {
+	name    string
+	ip      string
+	fixture *ModelClaimFixture
+	server  *httptest.Server
 
-	server *httptest.Server
-	ip     string
-
+	mu           sync.Mutex
 	defaultPhase string
 	defaultReady bool
-	failures     int
-	nextPort     int32
+	models       map[string]modelclaimcontroller.RuntimeSnapshotModel
 
 	activateCalls   []modelclaimcontroller.ActivateRequest
 	deactivateCalls []modelclaimcontroller.DeactivateRequest
-	models          map[string]modelclaimcontroller.RuntimeSnapshotModel
 }
 
-// IP returns the address used by fixture pods to reach the runtime.
-func (f *FakeModelClaimRuntime) IP() string {
-	ginkgo.GinkgoHelper()
-	return f.ip
+func (r *fakePodRuntime) close() {
+	if r.server != nil {
+		r.server.Close()
+	}
 }
 
-// ServeHTTP handles the runtime activation, deactivation, snapshot, and model-list endpoints.
-func (f *FakeModelClaimRuntime) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	ginkgo.GinkgoHelper()
+// ServeHTTP handles the runtime activation, deactivate, snapshot, and model-list endpoints.
+func (r *fakePodRuntime) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	switch {
-	case r.Method == http.MethodPost && r.URL.Path == "/v1/runtime/models/activate":
-		f.handleActivate(w, r)
-	case r.Method == http.MethodPost && r.URL.Path == "/v1/runtime/models/deactivate":
-		f.handleDeactivate(w, r)
-	case r.Method == http.MethodGet && r.URL.Path == "/v1/runtime/snapshot":
-		f.handleSnapshot(w)
-	case r.Method == http.MethodGet && r.URL.Path == "/v1/runtime/models":
-		f.handleModelList(w)
+	case req.Method == http.MethodPost && req.URL.Path == "/v1/runtime/models/activate":
+		r.handleActivate(w, req)
+	case req.Method == http.MethodPost && req.URL.Path == "/v1/runtime/models/deactivate":
+		r.handleDeactivate(w, req)
+	case req.Method == http.MethodGet && req.URL.Path == "/v1/runtime/snapshot":
+		r.handleSnapshot(w)
+	case req.Method == http.MethodGet && req.URL.Path == "/v1/runtime/models":
+		r.handleModelList(w)
 	default:
 		http.Error(w, "unsupported fake runtime operation", http.StatusNotFound)
 	}
 }
 
-func (f *FakeModelClaimRuntime) handleActivate(w http.ResponseWriter, r *http.Request) {
-	req := modelclaimcontroller.ActivateRequest{}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+func (r *fakePodRuntime) handleActivate(w http.ResponseWriter, req *http.Request) {
+	in := modelclaimcontroller.ActivateRequest{}
+	if err := json.NewDecoder(req.Body).Decode(&in); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.activateCalls = append(f.activateCalls, req)
-	if f.failures > 0 {
-		f.failures--
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.activateCalls = append(r.activateCalls, in)
+
+	r.fixture.mu.Lock()
+	fail := r.fixture.activateFailures > 0
+	if fail {
+		r.fixture.activateFailures--
+	}
+	port := r.fixture.allocPort()
+	phase, ready := r.defaultPhase, r.defaultReady
+	r.fixture.mu.Unlock()
+
+	if fail {
 		http.Error(w, "injected activation failure", http.StatusServiceUnavailable)
 		return
 	}
 
 	uid := ""
-	if req.ClaimRef != nil {
-		uid = req.ClaimRef.UID
+	if in.ClaimRef != nil {
+		uid = in.ClaimRef.UID
 	}
-	port := f.nextPort
-	f.nextPort++
-	f.models[uid] = modelclaimcontroller.RuntimeSnapshotModel{
-		ModelName:   req.ModelName,
-		ArtifactURL: req.ArtifactURL,
-		ClaimRef:    req.ClaimRef,
+	r.models[uid] = modelclaimcontroller.RuntimeSnapshotModel{
+		ModelName:   in.ModelName,
+		ArtifactURL: in.ArtifactURL,
+		ClaimRef:    in.ClaimRef,
 		Port:        port,
-		IPCName:     req.IPCName,
-		Phase:       f.defaultPhase,
-		Alive:       f.defaultPhase != "failed",
-		Ready:       f.defaultReady,
+		IPCName:     in.IPCName,
+		Phase:       phase,
+		Alive:       phase != "failed",
+		Ready:       ready,
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	_ = json.NewEncoder(w).Encode(modelclaimcontroller.ActivateResponse{
-		Status: "success", ModelName: req.ModelName, Port: port, IPCName: req.IPCName,
+		Status: "success", ModelName: in.ModelName, Port: port, IPCName: in.IPCName,
 	})
 }
 
-func (f *FakeModelClaimRuntime) handleDeactivate(w http.ResponseWriter, r *http.Request) {
-	req := modelclaimcontroller.DeactivateRequest{}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+func (r *fakePodRuntime) handleDeactivate(w http.ResponseWriter, req *http.Request) {
+	in := modelclaimcontroller.DeactivateRequest{}
+	if err := json.NewDecoder(req.Body).Decode(&in); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.deactivateCalls = append(f.deactivateCalls, req)
-	for uid, model := range f.models {
-		if model.ModelName == req.ModelName {
-			delete(f.models, uid)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.deactivateCalls = append(r.deactivateCalls, in)
+
+	r.fixture.mu.Lock()
+	fail := r.fixture.deactivateFailures > 0
+	if fail {
+		r.fixture.deactivateFailures--
+	}
+	r.fixture.mu.Unlock()
+	if fail {
+		http.Error(w, "injected deactivate failure", http.StatusServiceUnavailable)
+		return
+	}
+	for uid, model := range r.models {
+		if model.ModelName == in.ModelName {
+			delete(r.models, uid)
 		}
 	}
 	w.WriteHeader(http.StatusOK)
 }
 
-func (f *FakeModelClaimRuntime) handleSnapshot(w http.ResponseWriter) {
-	f.mu.Lock()
-	models := make([]modelclaimcontroller.RuntimeSnapshotModel, 0, len(f.models))
-	for _, model := range f.models {
+func (r *fakePodRuntime) handleSnapshot(w http.ResponseWriter) {
+	r.mu.Lock()
+	models := make([]modelclaimcontroller.RuntimeSnapshotModel, 0, len(r.models))
+	for _, model := range r.models {
 		models = append(models, model)
 	}
-	f.mu.Unlock()
+	r.mu.Unlock()
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(modelclaimcontroller.RuntimeSnapshot{
@@ -319,10 +407,10 @@ func (f *FakeModelClaimRuntime) handleSnapshot(w http.ResponseWriter) {
 	})
 }
 
-func (f *FakeModelClaimRuntime) handleModelList(w http.ResponseWriter) {
-	f.mu.Lock()
-	models := make([]modelclaimcontroller.ModelInfo, 0, len(f.models))
-	for _, model := range f.models {
+func (r *fakePodRuntime) handleModelList(w http.ResponseWriter) {
+	r.mu.Lock()
+	models := make([]modelclaimcontroller.ModelInfo, 0, len(r.models))
+	for _, model := range r.models {
 		models = append(models, modelclaimcontroller.ModelInfo{
 			ModelName: model.ModelName,
 			Port:      model.Port,
@@ -331,7 +419,7 @@ func (f *FakeModelClaimRuntime) handleModelList(w http.ResponseWriter) {
 			Ready:     model.Ready,
 		})
 	}
-	f.mu.Unlock()
+	r.mu.Unlock()
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(struct {
@@ -339,75 +427,135 @@ func (f *FakeModelClaimRuntime) handleModelList(w http.ResponseWriter) {
 	}{Models: models})
 }
 
-// SetDefaultState sets the initial phase and readiness of future activations.
-func (f *FakeModelClaimRuntime) SetDefaultState(phase string, ready bool) {
-	ginkgo.GinkgoHelper()
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.defaultPhase = phase
-	f.defaultReady = ready
-}
-
-// FailNextActivations injects failures into the next count activation requests.
-func (f *FakeModelClaimRuntime) FailNextActivations(count int) {
-	ginkgo.GinkgoHelper()
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.failures = count
-}
-
-// SetClaimState updates the runtime state for an already activated claim UID.
-func (f *FakeModelClaimRuntime) SetClaimState(uid, phase string, ready bool, lastError string) {
-	ginkgo.GinkgoHelper()
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	model, found := f.models[uid]
-	gomega.Expect(found).To(gomega.BeTrue(), "fake runtime has no model for claim UID %s", uid)
+func (r *fakePodRuntime) setClaimState(uid, phase string, ready bool, lastError string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	model, found := r.models[uid]
+	if !found {
+		return
+	}
 	model.Phase = phase
 	model.Ready = ready
 	model.Alive = phase != "failed"
 	model.LastError = lastError
-	f.models[uid] = model
+	r.models[uid] = model
 }
 
-// ActivateCallCount returns the total number of activation attempts, including failures.
-func (f *FakeModelClaimRuntime) ActivateCallCount() int {
-	ginkgo.GinkgoHelper()
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return len(f.activateCalls)
+// FakeModelClaimFleet is the test-facing facade over all per-pod runtimes.
+type FakeModelClaimFleet struct {
+	fixture *ModelClaimFixture
 }
 
-// DeactivateRequests returns a defensive copy of the recorded deactivation requests.
-func (f *FakeModelClaimRuntime) DeactivateRequests() []modelclaimcontroller.DeactivateRequest {
-	ginkgo.GinkgoHelper()
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return append([]modelclaimcontroller.DeactivateRequest(nil), f.deactivateCalls...)
+// SetDefaultState sets the initial phase/readiness for future activations.
+func (fl *FakeModelClaimFleet) SetDefaultState(phase string, ready bool) {
+	fl.fixture.mu.Lock()
+	defer fl.fixture.mu.Unlock()
+	fl.fixture.defaultPhase = phase
+	fl.fixture.defaultReady = ready
 }
 
-// ClaimUIDs returns the unique claim UIDs recorded in activation requests.
-func (f *FakeModelClaimRuntime) ClaimUIDs() []string {
-	ginkgo.GinkgoHelper()
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	unique := make(map[string]struct{}, len(f.activateCalls))
-	for i := range f.activateCalls {
-		if f.activateCalls[i].ClaimRef != nil {
-			unique[f.activateCalls[i].ClaimRef.UID] = struct{}{}
+// FailNextActivations injects failures into the next count activations fleet-wide.
+func (fl *FakeModelClaimFleet) FailNextActivations(count int) {
+	fl.fixture.mu.Lock()
+	defer fl.fixture.mu.Unlock()
+	fl.fixture.activateFailures = count
+}
+
+// FailNextDeactivations injects failures into the next count deactivations fleet-wide.
+func (fl *FakeModelClaimFleet) FailNextDeactivations(count int) {
+	fl.fixture.mu.Lock()
+	defer fl.fixture.mu.Unlock()
+	fl.fixture.deactivateFailures = count
+}
+
+// SetClaimState updates runtime state for a claim UID on every hosting pod.
+func (fl *FakeModelClaimFleet) SetClaimState(uid, phase string, ready bool, lastError string) {
+	fl.fixture.forEachPodRuntime(func(rt *fakePodRuntime) {
+		rt.setClaimState(uid, phase, ready, lastError)
+	})
+}
+
+// SetPodClaimState updates runtime state for a claim UID on one specific pod.
+func (fl *FakeModelClaimFleet) SetPodClaimState(podName, uid, phase string, ready bool, lastError string) {
+	rt, ok := fl.fixture.runtimeForPod(podName)
+	gomega.Expect(ok).To(gomega.BeTrue(), "no fake runtime for pod %s", podName)
+	rt.setClaimState(uid, phase, ready, lastError)
+}
+
+// ActivateCallCount returns total activation attempts across all pods.
+func (fl *FakeModelClaimFleet) ActivateCallCount() int {
+	total := 0
+	fl.fixture.forEachPodRuntime(func(rt *fakePodRuntime) {
+		rt.mu.Lock()
+		total += len(rt.activateCalls)
+		rt.mu.Unlock()
+	})
+	return total
+}
+
+// DeactivateRequests returns all recorded deactivation requests fleet-wide.
+func (fl *FakeModelClaimFleet) DeactivateRequests() []modelclaimcontroller.DeactivateRequest {
+	var out []modelclaimcontroller.DeactivateRequest
+	fl.fixture.forEachPodRuntime(func(rt *fakePodRuntime) {
+		rt.mu.Lock()
+		out = append(out, rt.deactivateCalls...)
+		rt.mu.Unlock()
+	})
+	return out
+}
+
+// ActivatePodIPs returns pod IPs (deduplicated) that received activations.
+func (fl *FakeModelClaimFleet) ActivatePodIPs() []string {
+	seen := map[string]struct{}{}
+	fl.fixture.forEachPodRuntime(func(rt *fakePodRuntime) {
+		rt.mu.Lock()
+		if len(rt.activateCalls) > 0 {
+			seen[rt.ip] = struct{}{}
 		}
+		rt.mu.Unlock()
+	})
+	out := make([]string, 0, len(seen))
+	for ip := range seen {
+		out = append(out, ip)
 	}
-	uids := make([]string, 0, len(unique))
-	for uid := range unique {
-		uids = append(uids, uid)
-	}
-	return uids
+	sort.Strings(out)
+	return out
 }
 
-// Close stops the fake server and tolerates incomplete setup.
-func (f *FakeModelClaimRuntime) Close() {
-	ginkgo.GinkgoHelper()
-	if f != nil && f.server != nil {
-		f.server.Close()
+// ActivatePods returns the names of pods that received at least one activation.
+func (fl *FakeModelClaimFleet) ActivatePods() []string {
+	seen := map[string]struct{}{}
+	fl.fixture.forEachPodRuntime(func(rt *fakePodRuntime) {
+		rt.mu.Lock()
+		if len(rt.activateCalls) > 0 {
+			seen[rt.name] = struct{}{}
+		}
+		rt.mu.Unlock()
+	})
+	out := make([]string, 0, len(seen))
+	for name := range seen {
+		out = append(out, name)
 	}
+	sort.Strings(out)
+	return out
+}
+
+// ClaimUIDs returns unique claim UIDs recorded in activation requests.
+func (fl *FakeModelClaimFleet) ClaimUIDs() []string {
+	unique := map[string]struct{}{}
+	fl.fixture.forEachPodRuntime(func(rt *fakePodRuntime) {
+		rt.mu.Lock()
+		for i := range rt.activateCalls {
+			if rt.activateCalls[i].ClaimRef != nil {
+				unique[rt.activateCalls[i].ClaimRef.UID] = struct{}{}
+			}
+		}
+		rt.mu.Unlock()
+	})
+	out := make([]string, 0, len(unique))
+	for uid := range unique {
+		out = append(out, uid)
+	}
+	sort.Strings(out)
+	return out
 }

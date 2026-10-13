@@ -90,13 +90,19 @@ func (uniformLocality) Cost(model, nodeName string) float64 { return 0 }
 // A nil provider is treated as uniform (load-only), preserving the existing
 // deterministic fallback when runtime observations are unavailable.
 func selectPodForActivation(candidates []corev1.Pod, alreadyOn map[string]bool, load map[string]int, model string, locality LocalityProvider) (*corev1.Pod, error) {
-	return selectPodForActivationWithState(candidates, alreadyOn, load, model, locality, nil)
+	return selectPodForActivationWithState(candidates, alreadyOn, load, model, locality, nil, 0)
 }
 
 // selectPodForActivationWithState first prefers a pod that already has the
 // artifact locally, then live GPU/KV observations, and finally the Phase-1
 // locality/load/name rank. Missing runtime state is safe: it simply falls back
 // to the existing deterministic placement behavior.
+//
+// hbmRequiredBytes is the estimated per-instance HBM footprint (see
+// hbmRequirementFromSnapshots). When positive, a pod with a known free-HBM
+// value below it is infeasible and never selected; a pod whose free HBM is
+// unknown stays eligible, so an unobservable runtime can never wedge
+// scheduling.
 func selectPodForActivationWithState(
 	candidates []corev1.Pod,
 	alreadyOn map[string]bool,
@@ -104,6 +110,7 @@ func selectPodForActivationWithState(
 	model string,
 	locality LocalityProvider,
 	states map[string]PodPlacementState,
+	hbmRequiredBytes int64,
 ) (*corev1.Pod, error) {
 	if locality == nil {
 		locality = uniformLocality{}
@@ -118,6 +125,9 @@ func selectPodForActivationWithState(
 			continue
 		}
 		state := states[pod.Name]
+		if !podFitsHBMRequirement(state, hbmRequiredBytes) {
+			continue
+		}
 		loc := locality.Cost(model, pod.Spec.NodeName)
 		l := load[pod.Name]
 		if best == nil || placementStateLess(state, bestState) ||
@@ -126,9 +136,40 @@ func selectPodForActivationWithState(
 		}
 	}
 	if best == nil {
+		if hbmRequiredBytes > 0 && anyPodBlockedByHBM(candidates, alreadyOn, states, hbmRequiredBytes) {
+			return nil, fmt.Errorf("no candidate warm pod has enough free GPU HBM for model")
+		}
 		return nil, fmt.Errorf("no available candidate warm pod for model")
 	}
 	return best, nil
+}
+
+// podFitsHBMRequirement reports whether a pod can host one more engine given
+// its observed free HBM. Unknown free HBM (no snapshot or unreadable memory
+// topology) is treated as eligible rather than risking a scheduling deadlock
+// on missing observability.
+func podFitsHBMRequirement(state PodPlacementState, hbmRequiredBytes int64) bool {
+	if hbmRequiredBytes <= 0 || !state.MemoryKnown {
+		return true
+	}
+	return state.HBMFreeBytes >= hbmRequiredBytes
+}
+
+// anyPodBlockedByHBM distinguishes "no pod at all / all already used" from
+// "eligible pods exist but none has enough free HBM" so the controller can
+// surface the actionable condition.
+func anyPodBlockedByHBM(candidates []corev1.Pod, alreadyOn map[string]bool, states map[string]PodPlacementState, hbmRequiredBytes int64) bool {
+	for i := range candidates {
+		pod := &candidates[i]
+		if alreadyOn[pod.Name] {
+			continue
+		}
+		state := states[pod.Name]
+		if state.MemoryKnown && state.HBMFreeBytes < hbmRequiredBytes {
+			return true
+		}
+	}
+	return false
 }
 
 // placementStateLess returns whether a ranks ahead of b using live runtime

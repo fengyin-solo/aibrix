@@ -64,6 +64,31 @@ func (r VineyardReconciler) Reconcile(ctx context.Context, kvCache *orchestratio
 	return ctrl.Result{}, nil
 }
 
+// CleanupForeignResources removes resources created by the distributed backends
+// (HPKV/InfiniStore): the cache StatefulSet, the headless Service, the
+// in-cluster Redis metadata Pod and Service, and the watcher resources. The
+// per-backend resources share fixed names, so NotFound is expected once the
+// cleanup has converged.
+func (r *VineyardReconciler) CleanupForeignResources(ctx context.Context, kvCache *orchestrationv1alpha1.KVCache) error {
+	namespace := kvCache.Namespace
+	var errs []error
+	objects := []client.Object{
+		&appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: kvCache.Name, Namespace: namespace}},
+		&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: headlessServiceName(kvCache.Name), Namespace: namespace}},
+		&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: redisName(kvCache.Name), Namespace: namespace}},
+		&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: redisName(kvCache.Name), Namespace: namespace}},
+	}
+	for _, obj := range objects {
+		if err := r.deleteObjectIfExists(ctx, obj); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if err := r.cleanupWatcherResources(ctx, kvCache); err != nil {
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
+}
+
 func (r *VineyardReconciler) reconcileMetadataService(ctx context.Context, kvCache *orchestrationv1alpha1.KVCache) error {
 	if kvCache.Spec.Metadata.Etcd == nil && kvCache.Spec.Metadata.Redis == nil {
 		return errors.New("either etcd or redis configuration is required")
@@ -192,7 +217,7 @@ func buildEtcdPodService(etcdPodName string, kvCache *orchestrationv1alpha1.KVCa
 func buildEtcdAggregateService(kvCache *orchestrationv1alpha1.KVCache) *corev1.Service {
 	etcdService := &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      fmt.Sprintf("%s-etcd-service", kvCache.Name),
+			Name:      etcdAggregateServiceName(kvCache.Name),
 			Namespace: kvCache.Namespace,
 			Labels: map[string]string{
 				constants.KVCacheLabelKeyIdentifier: kvCache.Name,
@@ -404,7 +429,7 @@ func buildVineyardDeployment(kvCache *orchestrationv1alpha1.KVCache) *appsv1.Dep
 func buildVineyardRpcService(kvCache *orchestrationv1alpha1.KVCache) *corev1.Service {
 	service := &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      fmt.Sprintf("%s-rpc", kvCache.Name),
+			Name:      rpcServiceName(kvCache.Name),
 			Namespace: kvCache.Namespace,
 			Labels: map[string]string{
 				constants.KVCacheLabelKeyIdentifier: kvCache.Name,

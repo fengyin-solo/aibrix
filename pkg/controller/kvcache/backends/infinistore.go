@@ -126,7 +126,7 @@ func buildKVCacheWatcherPodForInfiniStore(kvCache *orchestrationv1alpha1.KVCache
 
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      fmt.Sprintf("%s-kvcache-watcher-pod", kvCache.Name),
+			Name:      watcherPodName(kvCache.Name),
 			Namespace: kvCache.Namespace,
 			Labels: map[string]string{
 				constants.KVCacheLabelKeyIdentifier: kvCache.Name,
@@ -370,7 +370,7 @@ func buildHeadlessServiceForInfiniStore(kvCache *orchestrationv1alpha1.KVCache) 
 
 	service := &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      fmt.Sprintf("%s-headless-service", kvCache.Name),
+			Name:      headlessServiceName(kvCache.Name),
 			Namespace: kvCache.Namespace,
 			Labels: map[string]string{
 				constants.KVCacheLabelKeyIdentifier: kvCache.Name,

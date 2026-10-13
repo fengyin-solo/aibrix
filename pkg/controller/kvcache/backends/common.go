@@ -28,13 +28,39 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 )
 
+// Resource name helpers shared by the backend reconcilers. The names are part
+// of the contract with existing deployments and must not change.
+func watcherPodName(kvCacheName string) string {
+	return fmt.Sprintf("%s-kvcache-watcher-pod", kvCacheName)
+}
+
+func redisName(kvCacheName string) string {
+	return fmt.Sprintf("%s-redis", kvCacheName)
+}
+
+func headlessServiceName(kvCacheName string) string {
+	return fmt.Sprintf("%s-headless-service", kvCacheName)
+}
+
+func rpcServiceName(kvCacheName string) string {
+	return fmt.Sprintf("%s-rpc", kvCacheName)
+}
+
+func etcdAggregateServiceName(kvCacheName string) string {
+	return fmt.Sprintf("%s-etcd-service", kvCacheName)
+}
+
+func etcdResourcePrefix(kvCacheName string) string {
+	return fmt.Sprintf("%s-etcd-", kvCacheName)
+}
+
 // buildRedisPod constructs a Kubernetes Pod object for running a Redis instance
 // as part of the KVCache deployment. This Redis Pod is typically used as metadata
 // service for kvcache backends like HPKV or InfiniStore to store their membership details.
 // TODO: pod needs to be changed to statefulsets or deployment in future.
 func buildRedisPod(kvCache *orchestrationv1alpha1.KVCache) *corev1.Pod {
 	image := kvCache.Spec.Metadata.Redis.Runtime.Image
-	redisPodName := fmt.Sprintf("%s-redis", kvCache.Name)
+	redisPodName := redisName(kvCache.Name)
 	envs := []corev1.EnvVar{}
 	if len(kvCache.Spec.Metadata.Redis.Runtime.Env) != 0 {
 		envs = append(envs, kvCache.Spec.Metadata.Redis.Runtime.Env...)
@@ -83,7 +109,7 @@ func buildRedisPod(kvCache *orchestrationv1alpha1.KVCache) *corev1.Pod {
 // associated with the given KVCache custom resource. This Service is typically
 // used to expose the Redis Pod(s) to other components in the system.
 func buildRedisService(kvCache *orchestrationv1alpha1.KVCache) *corev1.Service {
-	redisServiceName := fmt.Sprintf("%s-redis", kvCache.Name)
+	redisServiceName := redisName(kvCache.Name)
 	svc := &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      redisServiceName,
@@ -203,12 +229,9 @@ func parseSecretRef(ref string) (name, key string) {
 // address and wires the password via SecretKeyRef. Otherwise falls back to the
 // in-cluster Redis service at <name>-redis:6379 with an empty password.
 //
-// Limitation: ReconcilePodObject only reconciles the container image, not env vars.
-// If an operator later changes which secret/key passwordSecretRef points at or changes
-// the external address, the running watcher pod retains the old env vars. The secret
-// *value* is re-read by kubelet on pod restart (SecretKeyRef is a reference, not a
-// snapshot), but a change to the secret *name* or the address field requires deleting
-// and recreating the watcher pod for the new config to take effect.
+// Env vars are immutable Pod fields: ReconcilePodObject detects the drift and
+// recreates the watcher Pod when the external address or the password secret
+// reference changes.
 func buildRedisWatcherEnvVars(kvCache *orchestrationv1alpha1.KVCache) []corev1.EnvVar {
 	redisAddr := fmt.Sprintf("%s-redis:%d", kvCache.Name, 6379)
 	var redisPasswordEnv corev1.EnvVar

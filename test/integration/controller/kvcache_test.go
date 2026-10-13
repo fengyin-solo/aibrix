@@ -25,15 +25,13 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	orchestrationapi "github.com/vllm-project/aibrix/api/orchestration/v1alpha1"
 	"github.com/vllm-project/aibrix/pkg/constants"
-	"github.com/vllm-project/aibrix/pkg/controller/kvcache"
-	"github.com/vllm-project/aibrix/pkg/controller/kvcache/backends"
 	controllerutils "github.com/vllm-project/aibrix/test/utils/controller"
 )
 
@@ -76,43 +74,14 @@ func makeKVCache(namespace, name, backend string) *orchestrationapi.KVCache {
 	return kv
 }
 
-// makePod builds a schedulable-looking Pod. When cacheName is non-empty the Pod
-// carries the KVCache identifier label the controller's Pod watch filters on.
-func makePod(namespace, name, cacheName string) *corev1.Pod {
-	pod := &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      name,
-			Namespace: namespace,
-		},
-		Spec: corev1.PodSpec{
-			Containers: []corev1.Container{
-				{Name: "main", Image: "busybox:stable"},
-			},
-		},
+// makeKVCacheWithWatcher builds a KVCache that also runs a watcher Pod.
+func makeKVCacheWithWatcher(namespace, name, backend string) *orchestrationapi.KVCache {
+	kv := makeKVCache(namespace, name, backend)
+	kv.Spec.Watcher = &orchestrationapi.RuntimeSpec{
+		Replicas: 1,
+		Image:    "aibrix/kvcache-watcher:test",
 	}
-	if cacheName != "" {
-		pod.Labels = map[string]string{
-			constants.KVCacheLabelKeyIdentifier: cacheName,
-		}
-	}
-	return pod
-}
-
-// newKVCacheReconciler mirrors the backend wiring the controller uses in
-// production, so error paths asserted here match what the manager would hit.
-func newKVCacheReconciler() *kvcache.KVCacheReconciler {
-	hpkv := backends.NewDistributedReconciler(k8sClient, constants.KVCacheBackendHPKV)
-	infinistore := backends.NewDistributedReconciler(k8sClient, constants.KVCacheBackendInfinistore)
-
-	return &kvcache.KVCacheReconciler{
-		Client: k8sClient,
-		Scheme: k8sClient.Scheme(),
-		Backends: map[string]backends.BackendReconciler{
-			constants.KVCacheBackendVineyard:    backends.NewVineyardReconciler(k8sClient),
-			constants.KVCacheBackendHPKV:        hpkv,
-			constants.KVCacheBackendInfinistore: infinistore,
-		},
-	}
+	return kv
 }
 
 var _ = ginkgo.Describe("KVCache controller test", func() {
@@ -229,17 +198,26 @@ var _ = ginkgo.Describe("KVCache controller test", func() {
 			eventuallyGet(fmt.Sprintf("%s-rpc", kv.Name), svc)
 		})
 
-		ginkgo.It("returns a reconcile error for an unsupported backend and creates nothing", func() {
+		ginkgo.It("records an UnsupportedBackend condition and creates nothing for an unsupported backend", func() {
 			kv := makeKVCache(ns.Name, "bad-backend", "not-a-real-backend")
 			gomega.Expect(k8sClient.Create(ctx, kv)).To(gomega.Succeed())
 
-			// Drive the reconciler directly: the manager retries this object with
-			// backoff, so the returned error is only observable from a direct call.
-			_, err := newKVCacheReconciler().Reconcile(ctx, ctrl.Request{
-				NamespacedName: types.NamespacedName{Namespace: ns.Name, Name: kv.Name},
-			})
-			gomega.Expect(err).To(gomega.HaveOccurred())
-			gomega.Expect(err.Error()).To(gomega.Equal("unsupported backend: not-a-real-backend"))
+			// The manager drives the reconcile: an unsupported backend is a
+			// configuration error, so the reason is written to the object's
+			// conditions instead of being hot-retried as an error.
+			gomega.Eventually(func(g gomega.Gomega) {
+				fetched := &orchestrationapi.KVCache{}
+				g.Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns.Name, Name: kv.Name}, fetched)).
+					To(gomega.Succeed())
+				ready := meta.FindStatusCondition(fetched.Status.Conditions, orchestrationapi.KVCacheConditionReady)
+				g.Expect(ready).NotTo(gomega.BeNil())
+				g.Expect(ready.Status).To(gomega.Equal(metav1.ConditionFalse))
+				g.Expect(ready.Reason).To(gomega.Equal("UnsupportedBackend"))
+				g.Expect(ready.Message).To(gomega.ContainSubstring("not-a-real-backend"))
+				progressing := meta.FindStatusCondition(fetched.Status.Conditions, orchestrationapi.KVCacheConditionProgressing)
+				g.Expect(progressing).NotTo(gomega.BeNil())
+				g.Expect(progressing.Status).To(gomega.Equal(metav1.ConditionFalse))
+			}, kvCacheTimeout, kvCacheInterval).Should(gomega.Succeed())
 
 			// An unsupported backend must be inert, not partially applied.
 			consistentlyAbsent(kv.Name, &appsv1.Deployment{})
@@ -287,94 +265,89 @@ var _ = ginkgo.Describe("KVCache controller test", func() {
 		})
 	})
 
+	// The controller owns the cache StatefulSet, so StatefulSet events re-enqueue
+	// the KVCache and self-heal a deleted workload.
+	ginkgo.Context("statefulset-triggered reconciliation", func() {
+		ginkgo.It("re-creates a deleted cache StatefulSet through the ownership watch", func() {
+			kv := makeKVCache(ns.Name, "sts-trigger", constants.KVCacheBackendInfinistore)
+			gomega.Expect(k8sClient.Create(ctx, kv)).To(gomega.Succeed())
+
+			waitForDistributedKVCacheToSettle(kv.Name)
+
+			sts := &appsv1.StatefulSet{}
+			eventuallyGet(kv.Name, sts)
+			gomega.Expect(k8sClient.Delete(ctx, sts)).To(gomega.Succeed())
+
+			// The ownership event re-enqueues the KVCache and the StatefulSet is
+			// recreated even with no Pod activity.
+			eventuallyGet(kv.Name, &appsv1.StatefulSet{})
+		})
+	})
+
 	// The controller watches Pods carrying the KVCache identifier label and maps
-	// them back to the named KVCache. StatefulSets are deliberately absent from
-	// the controller's Owns() list, so deleting one produces no self-healing
-	// event -- that makes its recreation an unambiguous signal that the Pod
-	// event, and nothing else, drove the reconcile.
+	// them back to the named KVCache. Bare Pods (the watcher Pod) are not part of
+	// Owns(); the labeled Pod watch is their only event path, so deleting the
+	// watcher Pod proves the mapping drives the reconcile. Predicate filtering of
+	// unlabeled Pods is covered by Test_podWithLabelFilter in the unit suite.
 	ginkgo.Context("pod-triggered reconciliation", func() {
-		ginkgo.It("reconciles the KVCache named by the Pod's identifier label", func() {
-			kv := makeKVCache(ns.Name, "pod-trigger", constants.KVCacheBackendInfinistore)
+		ginkgo.It("re-creates a deleted watcher Pod through the labeled Pod watch", func() {
+			kv := makeKVCacheWithWatcher(ns.Name, "watcher-trigger", constants.KVCacheBackendInfinistore)
 			gomega.Expect(k8sClient.Create(ctx, kv)).To(gomega.Succeed())
 
 			waitForDistributedKVCacheToSettle(kv.Name)
+			watcherName := fmt.Sprintf("%s-kvcache-watcher-pod", kv.Name)
+			watcher := &corev1.Pod{}
+			eventuallyGet(watcherName, watcher)
 
-			sts := &appsv1.StatefulSet{}
-			eventuallyGet(kv.Name, sts)
-			gomega.Expect(k8sClient.Delete(ctx, sts)).To(gomega.Succeed())
-			consistentlyAbsent(kv.Name, &appsv1.StatefulSet{})
+			gomega.Expect(k8sClient.Delete(ctx, watcher)).To(gomega.Succeed())
 
-			gomega.Expect(k8sClient.Create(ctx, makePod(ns.Name, "labeled-pod", kv.Name))).To(gomega.Succeed())
-
-			eventuallyGet(kv.Name, &appsv1.StatefulSet{})
-		})
-
-		ginkgo.It("reconciles the matching KVCache when a labeled Pod is deleted", func() {
-			kv := makeKVCache(ns.Name, "pod-delete", constants.KVCacheBackendInfinistore)
-			gomega.Expect(k8sClient.Create(ctx, kv)).To(gomega.Succeed())
-
-			waitForDistributedKVCacheToSettle(kv.Name)
-
-			sts := &appsv1.StatefulSet{}
-			eventuallyGet(kv.Name, sts)
-
-			// Create the Pod first; its create event is not what we are testing.
-			// Note: removing a Pod emits both an update (deletionTimestamp set)
-			// and a delete event, and either is enough to enqueue the KVCache, so
-			// this spec proves removal reconciles but cannot single out DeleteFunc.
-			// Test_podWithLabelFilter pins each predicate branch individually.
-			pod := makePod(ns.Name, "doomed-pod", kv.Name)
-			gomega.Expect(k8sClient.Create(ctx, pod)).To(gomega.Succeed())
-			eventuallyGet(pod.Name, &corev1.Pod{})
-
-			// Remove the unwatched StatefulSet and confirm nothing restores it,
-			// so the only thing left that can is the Pod delete event.
-			gomega.Expect(k8sClient.Delete(ctx, sts)).To(gomega.Succeed())
-			consistentlyAbsent(kv.Name, &appsv1.StatefulSet{})
-
-			gomega.Expect(k8sClient.Delete(ctx, pod)).To(gomega.Succeed())
-
-			eventuallyGet(kv.Name, &appsv1.StatefulSet{})
-		})
-
-		ginkgo.It("ignores Pods without the identifier label", func() {
-			kv := makeKVCache(ns.Name, "pod-no-label", constants.KVCacheBackendInfinistore)
-			gomega.Expect(k8sClient.Create(ctx, kv)).To(gomega.Succeed())
-
-			waitForDistributedKVCacheToSettle(kv.Name)
-
-			sts := &appsv1.StatefulSet{}
-			eventuallyGet(kv.Name, sts)
-			gomega.Expect(k8sClient.Delete(ctx, sts)).To(gomega.Succeed())
-
-			gomega.Expect(k8sClient.Create(ctx, makePod(ns.Name, "unlabeled-pod", ""))).To(gomega.Succeed())
-
-			// The predicate drops this Pod, so no reconcile is enqueued.
-			consistentlyAbsent(kv.Name, &appsv1.StatefulSet{})
+			// The labeled Pod delete event re-enqueues the KVCache and a fresh
+			// watcher Pod is created.
+			gomega.Eventually(func() types.UID {
+				recreated := &corev1.Pod{}
+				if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: ns.Name, Name: watcherName}, recreated); err != nil {
+					return ""
+				}
+				return recreated.UID
+			}, kvCacheTimeout, kvCacheInterval).ShouldNot(gomega.Equal(watcher.UID))
 		})
 
 		ginkgo.It("routes the Pod event only to the KVCache named by the label", func() {
-			target := makeKVCache(ns.Name, "route-target", constants.KVCacheBackendInfinistore)
-			other := makeKVCache(ns.Name, "route-other", constants.KVCacheBackendInfinistore)
+			target := makeKVCacheWithWatcher(ns.Name, "route-target", constants.KVCacheBackendInfinistore)
+			other := makeKVCacheWithWatcher(ns.Name, "route-other", constants.KVCacheBackendInfinistore)
 			gomega.Expect(k8sClient.Create(ctx, target)).To(gomega.Succeed())
 			gomega.Expect(k8sClient.Create(ctx, other)).To(gomega.Succeed())
 
 			waitForDistributedKVCacheToSettle(target.Name)
 			waitForDistributedKVCacheToSettle(other.Name)
 
-			targetSts := &appsv1.StatefulSet{}
-			otherSts := &appsv1.StatefulSet{}
-			eventuallyGet(target.Name, targetSts)
-			eventuallyGet(other.Name, otherSts)
+			targetWatcherName := fmt.Sprintf("%s-kvcache-watcher-pod", target.Name)
+			otherWatcherName := fmt.Sprintf("%s-kvcache-watcher-pod", other.Name)
+			targetWatcher := &corev1.Pod{}
+			otherWatcher := &corev1.Pod{}
+			eventuallyGet(targetWatcherName, targetWatcher)
+			eventuallyGet(otherWatcherName, otherWatcher)
+			otherUID := otherWatcher.UID
 
-			gomega.Expect(k8sClient.Delete(ctx, targetSts)).To(gomega.Succeed())
-			gomega.Expect(k8sClient.Delete(ctx, otherSts)).To(gomega.Succeed())
+			gomega.Expect(k8sClient.Delete(ctx, targetWatcher)).To(gomega.Succeed())
 
-			gomega.Expect(k8sClient.Create(ctx, makePod(ns.Name, "target-pod", target.Name))).To(gomega.Succeed())
+			// The target KVCache gets reconciled (its watcher Pod is recreated)...
+			gomega.Eventually(func() types.UID {
+				recreated := &corev1.Pod{}
+				if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: ns.Name, Name: targetWatcherName}, recreated); err != nil {
+					return ""
+				}
+				return recreated.UID
+			}, kvCacheTimeout, kvCacheInterval).ShouldNot(gomega.Equal(targetWatcher.UID))
 
-			// Only the KVCache named by the label is reconciled.
-			eventuallyGet(target.Name, &appsv1.StatefulSet{})
-			consistentlyAbsent(other.Name, &appsv1.StatefulSet{})
+			// ...while the other KVCache is not reconciled (its watcher Pod is
+			// untouched).
+			unchanged := &corev1.Pod{}
+			gomega.Consistently(func(g gomega.Gomega) {
+				g.Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns.Name, Name: otherWatcherName}, unchanged)).
+					To(gomega.Succeed())
+				g.Expect(unchanged.UID).To(gomega.Equal(otherUID))
+			}, kvCacheQuietWindow, kvCacheInterval).Should(gomega.Succeed())
 		})
 	})
 })

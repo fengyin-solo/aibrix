@@ -21,11 +21,14 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strings"
 
 	orchestrationv1alpha1 "github.com/vllm-project/aibrix/api/orchestration/v1alpha1"
 	"github.com/vllm-project/aibrix/pkg/constants"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/klog/v2"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -93,9 +96,82 @@ func (r *DistributedReconciler) Reconcile(ctx context.Context, kvCache *orchestr
 		if err := r.ReconcilePodObject(ctx, r.Backend.BuildWatcherPod(kvCache)); err != nil {
 			return ctrl.Result{}, err
 		}
+	} else {
+		// spec.watcher was removed (or never set on a reconcile after it was set):
+		// tear down the watcher Pod and its RBAC resources.
+		if err := r.cleanupWatcherResources(ctx, kvCache); err != nil {
+			return ctrl.Result{}, err
+		}
 	}
 
 	return ctrl.Result{}, nil
+}
+
+// CleanupForeignResources removes resources created by the vineyard backend
+// when the backend annotation switches to a distributed backend: the cache
+// Deployment, the RPC Service and the per-pod/aggregate etcd metadata Services
+// and Pods.
+func (r *DistributedReconciler) CleanupForeignResources(ctx context.Context, kvCache *orchestrationv1alpha1.KVCache) error {
+	namespace := kvCache.Namespace
+	var errs []error
+	objects := []client.Object{
+		&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: kvCache.Name, Namespace: namespace}},
+		&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: rpcServiceName(kvCache.Name), Namespace: namespace}},
+		&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: etcdAggregateServiceName(kvCache.Name), Namespace: namespace}},
+	}
+	for _, obj := range objects {
+		if err := r.deleteObjectIfExists(ctx, obj); err != nil {
+			errs = append(errs, err)
+		}
+	}
+
+	// Etcd Pods and their per-pod Services are indexed (<name>-etcd-0, ...), so
+	// enumerate them through the KVCache identifier and metadata role labels
+	// instead of guessing the previous replica count.
+	if err := r.deleteLabeledEtcdResources(ctx, kvCache, &corev1.PodList{}); err != nil {
+		errs = append(errs, err)
+	}
+	if err := r.deleteLabeledEtcdResources(ctx, kvCache, &corev1.ServiceList{}); err != nil {
+		errs = append(errs, err)
+	}
+
+	return errors.Join(errs...)
+}
+
+// deleteLabeledEtcdResources lists objects labeled as this KVCache's metadata
+// resources and deletes those belonging to the etcd family.
+func (r *DistributedReconciler) deleteLabeledEtcdResources(ctx context.Context, kvCache *orchestrationv1alpha1.KVCache, list client.ObjectList) error {
+	if err := r.List(ctx, list,
+		client.InNamespace(kvCache.Namespace),
+		client.MatchingLabels{
+			constants.KVCacheLabelKeyIdentifier: kvCache.Name,
+			constants.KVCacheLabelKeyRole:       constants.KVCacheLabelValueRoleMetadata,
+		},
+	); err != nil {
+		return err
+	}
+
+	var errs []error
+	prefix := etcdResourcePrefix(kvCache.Name)
+	process := func(obj client.Object) {
+		if !strings.HasPrefix(obj.GetName(), prefix) {
+			return
+		}
+		if err := r.deleteObjectIfExists(ctx, obj); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	switch l := list.(type) {
+	case *corev1.PodList:
+		for i := range l.Items {
+			process(&l.Items[i])
+		}
+	case *corev1.ServiceList:
+		for i := range l.Items {
+			process(&l.Items[i])
+		}
+	}
+	return errors.Join(errs...)
 }
 
 func (r *DistributedReconciler) reconcileMetadataService(ctx context.Context, kvCache *orchestrationv1alpha1.KVCache) error {

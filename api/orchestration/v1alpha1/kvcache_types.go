@@ -114,6 +114,15 @@ type KVCacheStatus struct {
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
 }
 
+// KVCache condition types reported in KVCacheStatus.Conditions.
+const (
+	// KVCacheConditionReady reports whether every expected cache replica is ready.
+	KVCacheConditionReady = "Ready"
+	// KVCacheConditionProgressing reports whether the cache workload is still
+	// deploying, scaling or rolling out.
+	KVCacheConditionProgressing = "Progressing"
+)
+
 //+kubebuilder:object:root=true
 //+kubebuilder:subresource:status
 

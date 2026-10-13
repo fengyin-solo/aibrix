@@ -19,6 +19,7 @@ package kvcache
 import (
 	"context"
 	"fmt"
+	"sync"
 
 	"github.com/vllm-project/aibrix/pkg/constants"
 	"k8s.io/apimachinery/pkg/types"
@@ -30,6 +31,8 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/klog/v2"
@@ -48,6 +51,16 @@ var (
 	controllerName = "kv-cache-controller"
 )
 
+// Condition reasons reported on the KVCache object.
+const (
+	reasonAllReplicasReady    = "AllReplicasReady"
+	reasonReplicasNotReady    = "ReplicasNotReady"
+	reasonReplicasProgressing = "ReplicasProgressing"
+	reasonReconcileComplete   = "ReconcileComplete"
+	reasonWorkloadNotFound    = "WorkloadNotFound"
+	reasonUnsupportedBackend  = "UnsupportedBackend"
+)
+
 // Add creates a new ModelAdapter Controller and adds it to the Manager with default RBAC.
 // The Manager will set fields on the Controller and Start it when the Manager is Started.
 func Add(mgr manager.Manager, runtimeConfig config.RuntimeConfig) error {
@@ -61,10 +74,11 @@ func Add(mgr manager.Manager, runtimeConfig config.RuntimeConfig) error {
 // newReconciler returns a new reconcile.Reconciler
 func newReconciler(mgr manager.Manager, runtimeConfig config.RuntimeConfig) (reconcile.Reconciler, error) {
 	reconciler := &KVCacheReconciler{
-		Client:        mgr.GetClient(),
-		Scheme:        mgr.GetScheme(),
-		Recorder:      mgr.GetEventRecorderFor(controllerName),
-		RuntimeConfig: runtimeConfig,
+		Client:          mgr.GetClient(),
+		Scheme:          mgr.GetScheme(),
+		Recorder:        mgr.GetEventRecorderFor(controllerName),
+		RuntimeConfig:   runtimeConfig,
+		cleanedBackends: map[types.NamespacedName]string{},
 		Backends: map[string]backends.BackendReconciler{
 			constants.KVCacheBackendVineyard:    backends.NewVineyardReconciler(mgr.GetClient()),
 			constants.KVCacheBackendHPKV:        backends.NewDistributedReconciler(mgr.GetClient(), constants.KVCacheBackendHPKV),
@@ -122,6 +136,7 @@ func add(mgr manager.Manager, r reconcile.Reconciler) error {
 		For(&orchestrationv1alpha1.KVCache{}).
 		Owns(&corev1.Service{}).
 		Owns(&appsv1.Deployment{}).
+		Owns(&appsv1.StatefulSet{}).
 		Watches(&corev1.Pod{},
 			handler.EnqueueRequestsFromMapFunc(kvCacheRequestsForPod),
 			builder.WithPredicates(podWithLabelFilter(constants.KVCacheLabelKeyIdentifier))).
@@ -141,6 +156,31 @@ type KVCacheReconciler struct {
 	Recorder      record.EventRecorder
 	RuntimeConfig config.RuntimeConfig
 	Backends      map[string]backends.BackendReconciler
+
+	// cleanedBackends records, per KVCache, the backend whose foreign resources
+	// have already been cleaned up. Labeled Pod events trigger frequent
+	// reconciles, so cleanup only runs again when the backend annotation value
+	// changes. A failed cleanup is never recorded and is retried.
+	cleanupMu       sync.Mutex
+	cleanedBackends map[types.NamespacedName]string
+}
+
+// foreignCleanupPending reports whether cleanup for currentBackend still needs
+// to run.
+func (r *KVCacheReconciler) foreignCleanupPending(key types.NamespacedName, currentBackend string) bool {
+	r.cleanupMu.Lock()
+	defer r.cleanupMu.Unlock()
+	return r.cleanedBackends[key] != currentBackend
+}
+
+// markForeignCleanupDone records a successful cleanup for currentBackend.
+func (r *KVCacheReconciler) markForeignCleanupDone(key types.NamespacedName, currentBackend string) {
+	r.cleanupMu.Lock()
+	defer r.cleanupMu.Unlock()
+	if r.cleanedBackends == nil {
+		r.cleanedBackends = map[types.NamespacedName]string{}
+	}
+	r.cleanedBackends[key] = currentBackend
 }
 
 // +kubebuilder:rbac:groups=orchestration.aibrix.ai,resources=kvcaches,verbs=get;list;watch;create;update;patch;delete
@@ -177,11 +217,237 @@ func (r *KVCacheReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	backend := getKVCacheBackendFromAnnotations(kvCache)
 	backendHandler, ok := r.Backends[backend]
 	if !ok {
-		klog.Warningf("unsupported backend %s", backend)
-		return ctrl.Result{}, fmt.Errorf("unsupported backend: %s", backend)
+		// An unsupported backend is a configuration error: surface it on the
+		// object instead of returning an error and hot-looping retries.
+		return r.reconcileUnsupportedBackend(ctx, kvCache, backend)
 	}
 
-	return backendHandler.Reconcile(ctx, kvCache)
+	// Remove resources created by a previously selected backend first. A
+	// cleanup failure must not block convergence of the current backend; it is
+	// retried via a requeue after the normal reconcile path below. Successful
+	// cleanup for a given backend is cached so Pod-event-driven reconciles do not
+	// reissue deletes on every invocation.
+	var cleanupErr error
+	if r.foreignCleanupPending(req.NamespacedName, backend) {
+		cleanupErr = backendHandler.CleanupForeignResources(ctx, kvCache)
+		if cleanupErr != nil {
+			klog.ErrorS(cleanupErr, "Failed to clean up resources from a previous backend",
+				"KVCache", req.NamespacedName, "backend", backend)
+		} else {
+			r.markForeignCleanupDone(req.NamespacedName, backend)
+		}
+	}
+
+	result, err := backendHandler.Reconcile(ctx, kvCache)
+	if err != nil {
+		return result, err
+	}
+
+	if err := r.syncKVCacheStatus(ctx, kvCache); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	if cleanupErr != nil {
+		// Requeue through the rate-limited queue so the foreign-resource cleanup
+		// is retried without a tight error loop.
+		return ctrl.Result{Requeue: true}, nil
+	}
+	return result, nil
+}
+
+// reconcileUnsupportedBackend writes the unsupported-backend reason into the
+// Ready/Progressing conditions and returns no error, so the controller does not
+// hot-retry an object the user must fix.
+func (r *KVCacheReconciler) reconcileUnsupportedBackend(ctx context.Context, kvCache *orchestrationv1alpha1.KVCache, backend string) (ctrl.Result, error) {
+	message := fmt.Sprintf("Unsupported backend %q: supported backends are %q, %q and %q",
+		backend, constants.KVCacheBackendVineyard, constants.KVCacheBackendHPKV, constants.KVCacheBackendInfinistore)
+	conditions := []metav1.Condition{
+		{
+			Type:               orchestrationv1alpha1.KVCacheConditionReady,
+			Status:             metav1.ConditionFalse,
+			ObservedGeneration: kvCache.Generation,
+			Reason:             reasonUnsupportedBackend,
+			Message:            message,
+		},
+		{
+			Type:               orchestrationv1alpha1.KVCacheConditionProgressing,
+			Status:             metav1.ConditionFalse,
+			ObservedGeneration: kvCache.Generation,
+			Reason:             reasonUnsupportedBackend,
+			Message:            "No progress while the backend is unsupported",
+		},
+	}
+
+	if err := r.updateConditions(ctx, kvCache, conditions, false); err != nil {
+		return ctrl.Result{}, err
+	}
+	return ctrl.Result{}, nil
+}
+
+// cacheWorkloadObservation summarizes the cache workload (StatefulSet for the
+// distributed backends, Deployment for vineyard) used to derive status.
+type cacheWorkloadObservation struct {
+	desiredReplicas int32
+	readyReplicas   int32
+	updatedReplicas int32
+	// exists reports whether the workload object has been created yet.
+	exists bool
+	// rolloutComplete reports whether the workload is not in the middle of a
+	// rolling update.
+	rolloutComplete bool
+}
+
+// observeCacheWorkload reads the live cache workload. Both the distributed
+// backends and vineyard name the workload exactly like the KVCache, so the kind
+// alone distinguishes them.
+func (r *KVCacheReconciler) observeCacheWorkload(ctx context.Context, kvCache *orchestrationv1alpha1.KVCache) (cacheWorkloadObservation, error) {
+	desired := kvCache.Spec.Cache.Replicas
+	key := types.NamespacedName{Namespace: kvCache.Namespace, Name: kvCache.Name}
+
+	sts := &appsv1.StatefulSet{}
+	if err := r.Get(ctx, key, sts); err == nil {
+		if sts.Spec.Replicas != nil {
+			desired = *sts.Spec.Replicas
+		}
+		// Empty revisions mean the StatefulSet controller has not reported yet;
+		// treat that as "no rollout in progress" rather than an endless one.
+		rolloutComplete := sts.Status.CurrentRevision == sts.Status.UpdateRevision
+		return cacheWorkloadObservation{
+			desiredReplicas: desired,
+			readyReplicas:   sts.Status.ReadyReplicas,
+			updatedReplicas: sts.Status.UpdatedReplicas,
+			exists:          true,
+			rolloutComplete: rolloutComplete,
+		}, nil
+	} else if !errors.IsNotFound(err) {
+		return cacheWorkloadObservation{}, err
+	}
+
+	deployment := &appsv1.Deployment{}
+	if err := r.Get(ctx, key, deployment); err == nil {
+		if deployment.Spec.Replicas != nil {
+			desired = *deployment.Spec.Replicas
+		}
+		return cacheWorkloadObservation{
+			desiredReplicas: desired,
+			readyReplicas:   deployment.Status.ReadyReplicas,
+			updatedReplicas: deployment.Status.UpdatedReplicas,
+			exists:          true,
+			rolloutComplete: true,
+		}, nil
+	} else if !errors.IsNotFound(err) {
+		return cacheWorkloadObservation{}, err
+	}
+
+	return cacheWorkloadObservation{
+		desiredReplicas: desired,
+		rolloutComplete: false,
+	}, nil
+}
+
+// syncKVCacheStatus derives readyReplicas and the Ready/Progressing conditions
+// from the live cache workload and persists them only when something changed.
+func (r *KVCacheReconciler) syncKVCacheStatus(ctx context.Context, kvCache *orchestrationv1alpha1.KVCache) error {
+	observation, err := r.observeCacheWorkload(ctx, kvCache)
+	if err != nil {
+		return err
+	}
+
+	readyCondition := buildReadyCondition(kvCache.Generation, observation)
+	progressingCondition := buildProgressingCondition(kvCache.Generation, observation)
+
+	replicasChanged := kvCache.Status.ReadyReplicas != observation.readyReplicas
+	kvCache.Status.ReadyReplicas = observation.readyReplicas
+
+	return r.updateConditions(ctx, kvCache,
+		[]metav1.Condition{readyCondition, progressingCondition}, replicasChanged)
+}
+
+// updateConditions writes the status only when readyReplicas or one of the
+// conditions changed, so a steady-state reconcile performs no writes.
+func (r *KVCacheReconciler) updateConditions(ctx context.Context, kvCache *orchestrationv1alpha1.KVCache, conditions []metav1.Condition, replicasChanged bool) error {
+	changed := replicasChanged
+	for _, condition := range conditions {
+		if meta.SetStatusCondition(&kvCache.Status.Conditions, condition) {
+			changed = true
+		}
+	}
+	if !changed {
+		return nil
+	}
+	klog.InfoS("Updating KVCache status", "KVCache",
+		types.NamespacedName{Namespace: kvCache.Namespace, Name: kvCache.Name},
+		"readyReplicas", kvCache.Status.ReadyReplicas)
+	return r.Status().Update(ctx, kvCache)
+}
+
+func buildReadyCondition(generation int64, obs cacheWorkloadObservation) metav1.Condition {
+	if !obs.exists {
+		return metav1.Condition{
+			Type:               orchestrationv1alpha1.KVCacheConditionReady,
+			Status:             metav1.ConditionFalse,
+			ObservedGeneration: generation,
+			Reason:             reasonWorkloadNotFound,
+			Message: fmt.Sprintf("Cache workload has not been created yet: 0 of %d replicas ready, %d more required",
+				obs.desiredReplicas, obs.desiredReplicas),
+		}
+	}
+
+	missing := obs.desiredReplicas - obs.readyReplicas
+	if missing <= 0 && obs.readyReplicas >= obs.desiredReplicas {
+		return metav1.Condition{
+			Type:               orchestrationv1alpha1.KVCacheConditionReady,
+			Status:             metav1.ConditionTrue,
+			ObservedGeneration: generation,
+			Reason:             reasonAllReplicasReady,
+			Message:            fmt.Sprintf("All %d replicas are ready", obs.desiredReplicas),
+		}
+	}
+
+	if missing < 0 {
+		missing = 0
+	}
+	return metav1.Condition{
+		Type:               orchestrationv1alpha1.KVCacheConditionReady,
+		Status:             metav1.ConditionFalse,
+		ObservedGeneration: generation,
+		Reason:             reasonReplicasNotReady,
+		Message: fmt.Sprintf("%d of %d replicas ready, %d more required",
+			obs.readyReplicas, obs.desiredReplicas, missing),
+	}
+}
+
+func buildProgressingCondition(generation int64, obs cacheWorkloadObservation) metav1.Condition {
+	progressing := !obs.exists || !obs.rolloutComplete ||
+		obs.readyReplicas != obs.desiredReplicas ||
+		obs.updatedReplicas != obs.desiredReplicas
+	if !progressing {
+		return metav1.Condition{
+			Type:               orchestrationv1alpha1.KVCacheConditionProgressing,
+			Status:             metav1.ConditionFalse,
+			ObservedGeneration: generation,
+			Reason:             reasonReconcileComplete,
+			Message:            "All replicas are ready and up to date",
+		}
+	}
+
+	reason := reasonReplicasProgressing
+	message := fmt.Sprintf("%d of %d replicas ready, %d updated",
+		obs.readyReplicas, obs.desiredReplicas, obs.updatedReplicas)
+	if !obs.exists {
+		reason = reasonWorkloadNotFound
+		message = fmt.Sprintf("Cache workload has not been created yet; 0 of %d replicas ready", obs.desiredReplicas)
+	} else if !obs.rolloutComplete {
+		message = fmt.Sprintf("Rolling update in progress: %d of %d replicas updated",
+			obs.updatedReplicas, obs.desiredReplicas)
+	}
+	return metav1.Condition{
+		Type:               orchestrationv1alpha1.KVCacheConditionProgressing,
+		Status:             metav1.ConditionTrue,
+		ObservedGeneration: generation,
+		Reason:             reason,
+		Message:            message,
+	}
 }
 
 // getKVCacheBackendFromAnnotations returns the backend based on labels and annotations.
